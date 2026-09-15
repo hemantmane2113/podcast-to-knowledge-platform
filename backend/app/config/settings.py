@@ -31,10 +31,27 @@ class Settings(BaseSettings):
     embedding_model: str = ""
     vector_dimension: int = 1536
 
+    # Target size a chunk tries to reach before looking for a good place to
+    # stop (sentence end / pause gap). Not a hard limit.
     chunk_target_tokens: int = 800
+    # Below this, a chunk boundary is skipped in favor of continuing to
+    # accumulate more segments (except the transcript's trailing chunk,
+    # which may legitimately be smaller).
     chunk_min_tokens: int = 300
+    # Hard ceiling: a chunk is always cut at or before this, even if that
+    # means splitting a single long segment's text (see chunking_service.py).
     chunk_max_tokens: int = 1200
-    chunk_overlap_tokens: int = 100
+    # Segment-granular overlap between adjacent chunks, in approximate
+    # tokens. Defaults to 0 (disabled): nothing in Phase 3A consumes
+    # overlap (no embeddings/RAG yet — see ARCHITECTURE.md), so shipping
+    # it non-zero by default would just duplicate text with no current
+    # benefit. The mechanism is fully implemented and tested; set this
+    # above 0 once a real consumer (Phase 3C RAG) needs it.
+    chunk_overlap_tokens: int = 0
+    # A gap this long (or longer) between two consecutive segments is
+    # treated as a candidate chunk boundary (a natural pause in speech),
+    # one signal among several — never an absolute cut rule on its own.
+    chunk_pause_threshold_ms: int = 1500
 
     max_revision_attempts: int = 2
 

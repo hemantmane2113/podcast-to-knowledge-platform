@@ -9,10 +9,23 @@ Episode.last_error / ProcessingJob.error_message string.
 
 
 class AppError(Exception):
-    """Base class for all domain errors. Do not raise directly."""
+    """Base class for all domain errors. Do not raise directly.
+
+    `retryable` defaults to False deliberately: most domain errors (not
+    found, already processing, validation) describe state that won't
+    change on retry. Only TranscriptProviderError -- genuinely transient
+    external-call failures -- flips the default back to True, and its
+    subclasses override it individually where retrying is actually
+    pointless (auth, not-found, malformed response). Found via a real bug:
+    TranscriptNotFoundError (this module) had no `retryable` at all before
+    this, so worker code's `getattr(exc, "retryable", True)` silently
+    treated "no transcript exists for this episode" as worth retrying,
+    which can never succeed.
+    """
 
     code: str = "INTERNAL_ERROR"
     status_code: int = 500
+    retryable: bool = False
 
     def __init__(self, message: str | None = None):
         self.message = message or self.code

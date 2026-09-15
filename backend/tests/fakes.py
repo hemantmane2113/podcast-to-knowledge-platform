@@ -10,11 +10,17 @@ class FakeJobQueue(JobQueue):
 
     def __init__(self) -> None:
         self.enqueued: list[tuple[uuid.UUID, uuid.UUID]] = []
+        self.enqueued_processing: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     async def enqueue_transcript_ingestion(
         self, *, episode_id: uuid.UUID, job_id: uuid.UUID
     ) -> None:
         self.enqueued.append((episode_id, job_id))
+
+    async def enqueue_transcript_processing(
+        self, *, episode_id: uuid.UUID, job_id: uuid.UUID
+    ) -> None:
+        self.enqueued_processing.append((episode_id, job_id))
 
 
 class StubProvider(TranscriptProvider):

@@ -14,12 +14,16 @@ if TYPE_CHECKING:
 
 
 class JobType(str, enum.Enum):
-    """Only the job type Phase 2 actually creates. Later phases (cleaning,
-    chunking, article generation, verification, ...) add their own values
-    when they exist — not speculated here.
+    """Job types that actually exist. Later phases (article generation,
+    verification, ...) add their own values when they exist — not
+    speculated here.
     """
 
     TRANSCRIPT_INGESTION = "TRANSCRIPT_INGESTION"
+    # Cleaning + chunking together (Phase 3A) -- one job, since chunking
+    # always immediately consumes cleaning's output; see
+    # app/services/chunking_service.py and ARCHITECTURE.md.
+    TRANSCRIPT_PROCESSING = "TRANSCRIPT_PROCESSING"
 
 
 class JobStatus(str, enum.Enum):

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
+    from app.models.chunk import Chunk
     from app.models.episode import Episode
     from app.models.transcript_segment import TranscriptSegment
 
@@ -15,10 +16,10 @@ if TYPE_CHECKING:
 class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """The transcript for an episode, as returned by the transcript provider.
 
-    One episode has at most one Transcript in Phase 2 (raw/normalized text
-    only — no cleaning happens yet). Splitting this into raw vs. cleaned
-    versions is Phase 3 scope (PRODUCT_SPEC.md §18), deliberately not
-    modeled here.
+    One episode has at most one Transcript (raw/normalized text; cleaning
+    is applied at the segment level via TranscriptSegment.cleaned_text, not
+    as a separate transcript row — see that model's docstring and
+    ARCHITECTURE.md).
     """
 
     __tablename__ = "transcripts"
@@ -33,4 +34,9 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="transcript",
         cascade="all, delete-orphan",
         order_by="TranscriptSegment.sequence_number",
+    )
+    chunks: Mapped[list["Chunk"]] = relationship(
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        order_by="Chunk.sequence_number",
     )

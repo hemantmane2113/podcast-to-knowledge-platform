@@ -6,6 +6,7 @@ from arq.connections import RedisSettings
 from app.config import get_settings
 
 _TRANSCRIPT_INGESTION_TASK = "ingest_episode_transcript"
+_TRANSCRIPT_PROCESSING_TASK = "process_transcript"
 
 
 class JobQueue:
@@ -19,6 +20,11 @@ class JobQueue:
         self, *, episode_id: uuid.UUID, job_id: uuid.UUID
     ) -> None:
         await self._redis.enqueue_job(_TRANSCRIPT_INGESTION_TASK, str(episode_id), str(job_id))
+
+    async def enqueue_transcript_processing(
+        self, *, episode_id: uuid.UUID, job_id: uuid.UUID
+    ) -> None:
+        await self._redis.enqueue_job(_TRANSCRIPT_PROCESSING_TASK, str(episode_id), str(job_id))
 
 
 _pool: ArqRedis | None = None
