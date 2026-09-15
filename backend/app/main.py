@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from app.api.v1 import api_router
 from app.config import get_settings
+from app.core.error_handlers import register_error_handlers
 
 
 def create_app() -> FastAPI:
@@ -13,6 +14,7 @@ def create_app() -> FastAPI:
         debug=settings.app_env == "development",
     )
 
+    register_error_handlers(app)
     app.include_router(api_router)
 
     return app

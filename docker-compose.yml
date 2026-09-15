@@ -36,10 +36,35 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/podcast_to_knowledge}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Hard-coded to the compose service names (postgres/redis), NOT a
+      # passthrough of $DATABASE_URL/$REDIS_URL from .env: those are meant
+      # for running the backend natively against Docker-exposed ports
+      # (@localhost), which would be wrong inside this container. This
+      # `environment:` block always wins over `env_file:` for the same key
+      # (Compose precedence), so it overrides whatever .env sets.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-podcast_to_knowledge}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["arq", "app.worker.settings.WorkerSettings"]
+    env_file:
+      - .env
+    environment:
+      # See the backend service's comment above -- same reasoning applies.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-podcast_to_knowledge}
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./backend:/app
     depends_on:

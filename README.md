@@ -4,7 +4,7 @@ Turn conversations into knowledge.
 
 This platform transforms long-form podcast conversations (starting with YouTube) into high-quality, grounded, easy-to-read knowledge articles — roughly turning 2 hours of conversation into 15–30 minutes of high-quality reading. It is an AI editorial engine, not a basic summarizer: it understands the whole conversation, reorganizes its ideas into a coherent narrative, generates a readable article, and verifies that the article stays faithful to the original transcript.
 
-> **Status: Phase 1 — Foundation.** The repo scaffolding (Docker Compose, FastAPI skeleton, Next.js skeleton) is in place; the ingestion and AI processing pipelines have not been built yet — see [Current status](#current-status) below.
+> **Status: Phase 2 — Transcript Ingestion.** YouTube URL → Supadata → normalized transcript → PostgreSQL is implemented end-to-end, asynchronously, and queryable through the API. The AI processing pipeline (cleaning, chunking, article generation, verification) and the public reading/admin UI have not been built yet — see [Current status](#current-status) below.
 
 ## Documentation
 
@@ -18,8 +18,8 @@ Read the product spec first for *what* and *why*; read the architecture doc for 
 - **Frontend**: Next.js, TypeScript, Tailwind CSS
 - **Backend**: Python, FastAPI
 - **AI orchestration**: LangGraph, with LangChain used only where it materially simplifies an integration
-- **Database**: PostgreSQL with pgvector for embeddings
-- **Background processing**: Redis-backed async job queue
+- **Database**: PostgreSQL (pgvector for embeddings, from Phase 3 on), SQLAlchemy (async) + Alembic migrations
+- **Background processing**: Redis-backed async job queue ([arq](https://github.com/python-arq/arq))
 - **Transcript acquisition**: [Supadata](https://supadata.ai/) (YouTube transcripts), isolated behind a `TranscriptProvider` abstraction
 - **Deployment**: Docker-first; the whole stack runs locally via `docker compose up`
 
@@ -34,59 +34,71 @@ podcast-to-knowledge-platform/
 ├── ARCHITECTURE.md
 ├── docker-compose.yml
 ├── .env.example
-├── backend/                 # FastAPI app (health check only so far)
+├── .github/workflows/ci.yml   # backend pytest; frontend build + audit
+├── backend/
 │   ├── pyproject.toml
+│   ├── alembic.ini, alembic/  # one migration: episodes/transcripts/transcript_segments/processing_jobs
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── api/v1/          # health router
-│   │   ├── config/          # pydantic-settings
-│   │   └── core/
-│   └── tests/
-├── frontend/                 # Next.js app (placeholder homepage only so far)
+│   │   ├── api/               # health, episodes (create/get/transcript)
+│   │   ├── core/              # db engine, exceptions, error handlers
+│   │   ├── config/            # pydantic-settings, fails fast outside development
+│   │   ├── models/            # Episode, Transcript, TranscriptSegment, ProcessingJob
+│   │   ├── schemas/           # provider-normalized + API I/O schemas
+│   │   ├── repositories/      # DB access per entity
+│   │   ├── services/          # EpisodeService, IngestionService, JobQueue
+│   │   ├── providers/transcript/  # TranscriptProvider, SupadataTranscriptProvider
+│   │   └── worker/            # arq WorkerSettings + ingestion task
+│   └── tests/                 # unit/, integration/ (real Postgres, mocked Supadata)
+├── frontend/
 │   ├── package.json
 │   └── app/
-├── evaluation/               # evaluation dataset — not yet added
+│       ├── page.tsx           # placeholder homepage
+│       └── dev/ingest/        # tiny internal tool to trigger/inspect ingestion (not the real admin UI)
+├── evaluation/                # evaluation dataset — not yet added
 ├── docs/
 │   └── adr/
 └── scripts/
 ```
 
-The full target layout, with backend module responsibilities for later phases, is documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md#2-repository-structure).
+The full target layout, with backend module responsibilities for later phases and an explicit IMPLEMENTED/PLANNED status per component, is documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md#2-repository-structure).
 
 ## Current status
 
-This is the **Phase 1 — Foundation** stage described in `PRODUCT_SPEC.md` §97 and `ARCHITECTURE.md` §12. What exists today:
+**Phase 1 (Foundation)** and **Phase 2 (Transcript Ingestion)** are done, per `PRODUCT_SPEC.md` §97/§101 and `ARCHITECTURE.md` §13:
 
-- [x] Product specification (`PRODUCT_SPEC.md`)
-- [x] Architecture documentation (`ARCHITECTURE.md`)
-- [x] Environment variable reference (`.env.example`)
-- [x] Docker Compose (Postgres + pgvector, Redis, backend, frontend)
-- [x] FastAPI skeleton with `/api/v1/health` (tested, verified to boot and respond)
-- [x] Next.js skeleton with a placeholder homepage (verified to build)
-- [ ] Ingestion pipeline (YouTube URL → Supadata → normalized, persisted transcript)
-- [ ] AI processing pipeline (cleaning → chunking → analysis → article generation → verification)
-- [ ] Public reading experience and admin dashboard
-
-No business logic (ingestion, chunking, LLM calls, etc.) exists yet — this phase is scaffolding only, per `PRODUCT_SPEC.md` §100.
+- [x] Product spec, architecture doc, env var reference
+- [x] Docker Compose (Postgres + pgvector, Redis, backend, worker, frontend), CI (GitHub Actions)
+- [x] FastAPI skeleton with `/api/v1/health`; Next.js skeleton with a placeholder homepage
+- [x] YouTube URL validation, idempotent episode creation, async ingestion job (arq/Redis)
+- [x] `SupadataTranscriptProvider` behind a `TranscriptProvider` interface — metadata + transcript, normalized, never fabricated
+- [x] Episode/Transcript/TranscriptSegment/ProcessingJob persisted via SQLAlchemy + Alembic
+- [x] `POST /api/v1/episodes`, `GET /api/v1/episodes/{id}`, `GET /api/v1/episodes/{id}/transcript` — tested (61 backend tests) and verified against a real Postgres + Redis + live worker process, not just mocks
+- [x] Consistent API error model (`{"code", "message"}` with correct HTTP status), retry policy (max 3 attempts, non-retryable errors never retried), no partial persistence on failure
+- [ ] AI processing pipeline (cleaning → chunking → analysis → article generation → verification) — Phase 3+
+- [ ] Public reading experience and the real admin dashboard — Phase 6
 
 ## Local development
 
 ```bash
 cp .env.example .env   # fill in real values — never commit .env
-docker compose up      # Postgres (pgvector) + Redis + backend + frontend
+docker compose up      # Postgres (pgvector) + Redis + backend + worker + frontend
 ```
 
 - Backend health check: `http://localhost:8000/api/v1/health`
-- Frontend: `http://localhost:3000`
+- Ingest an episode: `POST http://localhost:8000/api/v1/episodes {"youtube_url": "https://www.youtube.com/watch?v=..."}` (requires a real `SUPADATA_API_KEY` in `.env` to actually fetch a transcript — without one, the job fails clearly rather than hanging)
+- Frontend: `http://localhost:3000`, or `http://localhost:3000/dev/ingest` for a minimal UI over the above
 
 To run services outside Docker during development:
 
 ```bash
-# Backend (requires Python 3.11+)
+# Backend (requires Python 3.11+ and a running Postgres + Redis)
 cd backend
 pip install -e ".[dev]"
-uvicorn app.main:app --reload
-pytest
+alembic upgrade head
+uvicorn app.main:app --reload      # API
+arq app.worker.settings.WorkerSettings   # worker, run in a separate terminal
+pytest                             # needs DATABASE_URL pointed at a real (test) Postgres — see tests/conftest.py
 
 # Frontend (requires Node 20+)
 cd frontend
