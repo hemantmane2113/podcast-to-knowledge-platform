@@ -49,7 +49,8 @@ async def test_get_transcript_success(provider: SupadataTranscriptProvider) -> N
     request = route.calls.last.request
     assert request.headers["x-api-key"] == "test-key"
     assert request.url.params["url"] == VIDEO_URL
-    assert request.url.params["mode"] == "native"
+    assert request.url.params["mode"] == "auto"
+    assert request.url.params["text"] == "false"
 
     assert transcript.language == "en"
     assert len(transcript.segments) == 2

@@ -9,7 +9,7 @@ docs) before pointing this at a production API key, per PRODUCT_SPEC.md §12
 ("do not assume the API response schema if documentation differs").
 
 Assumed contract:
-  GET {base}/transcript?url=<video_url>&mode=native&text=false
+  GET {base}/transcript?url=<video_url>&mode=auto&text=false
     -> 200 {"content": [{"text","offset","duration","lang"}, ...],
              "lang": "en", "availableLangs": ["en", ...]}
     -> 202 {"jobId": "..."}  (large videos process asynchronously;
@@ -23,12 +23,18 @@ Assumed contract:
              "additionalData": {"channelId"}, ...}
   Auth: header "x-api-key: <SUPADATA_API_KEY>"
 
-mode=native (rather than mode=auto) is used deliberately: it returns only
-transcripts that already exist (real captions) instead of paying to
-AI-generate one, which keeps the transcript closer to an authoritative
-source per PRODUCT_SPEC.md §88 ("never invent"). A video with no existing
-captions will surface as TranscriptProviderNotFoundError rather than
-silently falling back to a generated transcript.
+mode=auto (revised from an earlier mode=native choice — see ARCHITECTURE.md
+§4/§16 for the correction history) with text=false: `text=false` is
+non-negotiable, since the whole point of ingestion is timestamped segments
+(start_ms/duration_ms), not a plain string. `mode=auto` asks Supadata for
+native captions when they exist and falls back to generating a transcript
+when they don't, so ingestion doesn't fail outright for videos without
+official captions. This trades a small amount of §88 "never invent"
+purity (an AI-generated transcript is Supadata's best-effort transcription
+of the audio, not the creator's own captions) for actually getting a
+transcript for the common case of a podcast with no uploaded captions;
+the raw transcript is still stored verbatim as returned, never further
+altered by us.
 """
 
 import asyncio
@@ -72,7 +78,7 @@ class SupadataTranscriptProvider(TranscriptProvider):
         response = await self._request(
             "GET",
             "/transcript",
-            params={"url": video_url, "mode": "native", "text": "false"},
+            params={"url": video_url, "mode": "auto", "text": "false"},
         )
         payload = self._parse_json(response)
 
