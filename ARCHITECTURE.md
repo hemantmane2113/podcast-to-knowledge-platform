@@ -256,15 +256,13 @@ Secrets are never read by, or embedded in, frontend code (§54, §66) — the br
 
 ---
 
-## 11. Expected core dependencies
+## 11. Core dependencies
 
-These are not yet pinned (no `pyproject.toml`/`package.json` exist); listed here so Phase 1 scaffolding has a concrete target.
+**Backend** (pinned in `backend/pyproject.toml`): `fastapi`, `uvicorn`, `sqlalchemy` (async), `asyncpg`, `pydantic`/`pydantic-settings`, `redis`, `pytest`/`pytest-asyncio`/`httpx` for tests. Not yet added, needed starting Phase 2+: `alembic` (migrations, once models exist), `pgvector` (Python client, once embeddings are stored), an async task runner (`arq` or `celery` — still an open decision, see §13), `langgraph`, `langchain` (only where it simplifies a specific integration, per §9), an LLM SDK.
 
-**Backend**: `fastapi`, `uvicorn`, `sqlalchemy` (async), `alembic`, `psycopg` (or `asyncpg`), `pgvector`, `pydantic`/`pydantic-settings`, `redis`, an async task runner appropriate for Python (e.g. `arq` or `celery` — decide during Phase 1 based on the async-first requirement in §9/§57), `langgraph`, `langchain` (only where it simplifies a specific integration, per §9), an LLM SDK, `httpx`, `pytest`/`pytest-asyncio`.
+**Frontend** (pinned in `frontend/package.json`): `next@16`, `react@19`/`react-dom@19`, `typescript`, `tailwindcss`. The spec doesn't mandate a specific Next.js major version; 16 (current stable) was chosen at scaffold time specifically because Next 14.2.16, the version initially scaffolded, had multiple known CVEs (RSC cache poisoning, DoS, SSRF) with no fix in the 14.x line available at the time — `npm audit` must report 0 vulnerabilities before any dependency bump lands. A typed API client layer and a test runner (e.g. `vitest`/`playwright`) are not yet added.
 
-**Frontend**: `next`, `react`, `typescript`, `tailwindcss`, a typed API client layer, a test runner (e.g. `vitest`/`playwright`).
-
-**Infra**: `postgres` (pgvector-enabled image), `redis`, via `docker-compose.yml`.
+**Infra**: `pgvector/pgvector:pg16` (Postgres with pgvector pre-installed) and `redis:7-alpine`, via `docker-compose.yml`.
 
 ---
 

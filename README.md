@@ -4,7 +4,7 @@ Turn conversations into knowledge.
 
 This platform transforms long-form podcast conversations (starting with YouTube) into high-quality, grounded, easy-to-read knowledge articles — roughly turning 2 hours of conversation into 15–30 minutes of high-quality reading. It is an AI editorial engine, not a basic summarizer: it understands the whole conversation, reorganizes its ideas into a coherent narrative, generates a readable article, and verifies that the article stays faithful to the original transcript.
 
-> **Status: pre-implementation.** This repository currently contains product/engineering documentation only. No application code has been written yet — see [Current status](#current-status) below.
+> **Status: Phase 1 — Foundation.** The repo scaffolding (Docker Compose, FastAPI skeleton, Next.js skeleton) is in place; the ingestion and AI processing pipelines have not been built yet — see [Current status](#current-status) below.
 
 ## Documentation
 
@@ -25,24 +25,33 @@ Read the product spec first for *what* and *why*; read the architecture doc for 
 
 Architecture is a clean modular monolith (one FastAPI backend, one Next.js frontend) — no microservices, no Kubernetes, no dedicated vector database in V1. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the reasoning.
 
-## Repository structure (target)
+## Repository structure
 
 ```text
 podcast-to-knowledge-platform/
 ├── README.md
 ├── PRODUCT_SPEC.md
 ├── ARCHITECTURE.md
-├── docker-compose.yml       # not yet added
+├── docker-compose.yml
 ├── .env.example
-├── backend/                 # FastAPI app — not yet added
-├── frontend/                # Next.js app — not yet added
+├── backend/                 # FastAPI app (health check only so far)
+│   ├── pyproject.toml
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── api/v1/          # health router
+│   │   ├── config/          # pydantic-settings
+│   │   └── core/
+│   └── tests/
+├── frontend/                 # Next.js app (placeholder homepage only so far)
+│   ├── package.json
+│   └── app/
 ├── evaluation/               # evaluation dataset — not yet added
 ├── docs/
 │   └── adr/
 └── scripts/
 ```
 
-The full target layout, with backend module responsibilities, is documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md#2-repository-structure).
+The full target layout, with backend module responsibilities for later phases, is documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md#2-repository-structure).
 
 ## Current status
 
@@ -51,23 +60,39 @@ This is the **Phase 1 — Foundation** stage described in `PRODUCT_SPEC.md` §97
 - [x] Product specification (`PRODUCT_SPEC.md`)
 - [x] Architecture documentation (`ARCHITECTURE.md`)
 - [x] Environment variable reference (`.env.example`)
-- [ ] Docker Compose (Postgres + pgvector, Redis)
-- [ ] FastAPI skeleton with health check
-- [ ] Next.js skeleton
+- [x] Docker Compose (Postgres + pgvector, Redis, backend, frontend)
+- [x] FastAPI skeleton with `/api/v1/health` (tested, verified to boot and respond)
+- [x] Next.js skeleton with a placeholder homepage (verified to build)
 - [ ] Ingestion pipeline (YouTube URL → Supadata → normalized, persisted transcript)
 - [ ] AI processing pipeline (cleaning → chunking → analysis → article generation → verification)
 - [ ] Public reading experience and admin dashboard
 
-## Local development
+No business logic (ingestion, chunking, LLM calls, etc.) exists yet — this phase is scaffolding only, per `PRODUCT_SPEC.md` §100.
 
-Once the Phase 1 scaffolding lands, local development will be:
+## Local development
 
 ```bash
 cp .env.example .env   # fill in real values — never commit .env
-docker compose up      # PostgreSQL (pgvector) + Redis
+docker compose up      # Postgres (pgvector) + Redis + backend + frontend
 ```
 
-with the backend and frontend run locally against those services during development. This section will be filled in with concrete run instructions as `backend/` and `frontend/` are added.
+- Backend health check: `http://localhost:8000/api/v1/health`
+- Frontend: `http://localhost:3000`
+
+To run services outside Docker during development:
+
+```bash
+# Backend (requires Python 3.11+)
+cd backend
+pip install -e ".[dev]"
+uvicorn app.main:app --reload
+pytest
+
+# Frontend (requires Node 20+)
+cd frontend
+npm install
+npm run dev
+```
 
 ## Configuration
 
