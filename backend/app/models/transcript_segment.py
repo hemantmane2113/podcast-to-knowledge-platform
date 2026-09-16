@@ -13,16 +13,15 @@ if TYPE_CHECKING:
 
 
 class TranscriptSegment(UUIDPrimaryKeyMixin, Base):
-    """One provider-returned transcript segment.
-
-    `text`/`start_ms`/`duration_ms`/`speaker` are the raw provider output —
+    """One provider-returned transcript segment — raw provider output,
     write-once, never edited in place (a reprocess replaces the rows), so
-    there's no updated_at on those, just created_at. `cleaned_text` is the
-    one exception: it's a deterministic function of `text` populated by the
-    cleaning stage (app/services/cleaning_service.py), nullable until that
-    runs, and safe to recompute/overwrite on a rerun since cleaning is pure
-    (PRODUCT_SPEC.md §18 raw-vs-clean distinction, applied at segment
-    granularity rather than as a separate table — see ARCHITECTURE.md).
+    there's no updated_at, just created_at.
+
+    Deterministic cleaning (app/services/cleaning_service.py) never writes
+    back here: it returns a transient in-memory `CleanedSegment` per
+    segment, consumed directly by the chunker, so this table never mixes
+    raw source data with derived processing state (PRODUCT_SPEC.md §18
+    raw-vs-clean distinction — see ARCHITECTURE.md).
     """
 
     __tablename__ = "transcript_segments"
@@ -38,7 +37,6 @@ class TranscriptSegment(UUIDPrimaryKeyMixin, Base):
     sequence_number: Mapped[int] = mapped_column(Integer)
 
     text: Mapped[str] = mapped_column(Text)
-    cleaned_text: Mapped[str | None] = mapped_column(Text)
 
     # Position within the source media — distinct from database timestamps,
     # never coerced into a datetime column (locked decision).

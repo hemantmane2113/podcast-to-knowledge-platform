@@ -21,7 +21,7 @@ As of this revision: **Phase 1 (Foundation)**, **Phase 2 (Transcript Ingestion)*
 - **Modular monolith, not microservices** (§7, §91). One FastAPI backend with clear internal module boundaries; one Next.js frontend. ✅
 - **No premature infrastructure**: no Kubernetes, no dedicated vector DB, no multi-provider abstraction gold-plating, no Elasticsearch (§7, §69, §92). ✅
 - **Every external dependency is abstracted** behind a provider interface (§11, §64, §65, §93): `TranscriptProvider` ✅, `LLMProvider` ⬜, `EmbeddingProvider` ⬜, `StorageProvider` ⬜.
-- **The raw transcript is the source of truth** (§18, §98). ✅ `TranscriptSegment.text` (the provider's raw output) is never modified by cleaning — cleaning writes to a separate `cleaned_text` column (§5, §7). Nothing invented: speaker labels are never fabricated, and cleaning is deterministic, rule-based text normalization only — no LLM (§7).
+- **The raw transcript is the source of truth** (§18, §98). ✅ `TranscriptSegment.text` (the provider's raw output) is never modified by cleaning, and cleaning's output is never persisted onto the raw table at all — `clean_transcript_segments()` returns transient in-memory `CleanedSegment`s consumed directly by the chunker (§5, §7). Nothing invented: speaker labels are never fabricated, and cleaning is deterministic, rule-based text normalization only — no LLM (§7).
 - **Timestamps and speaker labels survive the entire pipeline** (§14, §19, §98). ✅ `start_ms`/`duration_ms`/`speaker` persisted per segment; every `Chunk` carries `start_ms`/`end_ms` derived from real segment boundaries (never interpolated) and a full list of the segment IDs it was built from (§7). The YouTube-timestamp-link UI itself is still ⬜ (no reading UI yet).
 - **Everything long-running is async and resumable** (§57, §75, §76). ✅ for ingestion and processing: both are background jobs (§6), each a single transaction on success (no partial writes) with a clear FAILED state on failure, never silently stuck.
 - **Human review gates publishing** (§77, §96). ⬜ — nothing to gate yet; there's no article/publishing concept in the schema.
@@ -151,7 +151,7 @@ class StorageProvider(ABC): ...                                # ⬜ PLANNED (no
 ```text
 Episode                                            ✅
    ├── Transcript (1:1)                            ✅
-   │       ├── TranscriptSegment (ordered)         ✅  text (raw) + cleaned_text (nullable, derived)
+   │       ├── TranscriptSegment (ordered)         ✅  text (raw only — cleaning is transient, not persisted)
    │       └── Chunk (ordered)                     ✅
    └── ProcessingJob (1:many)                      ✅
 
@@ -171,7 +171,7 @@ Episode
 ### Deviations from the original sketch (and why)
 
 - **No `Podcast` entity yet.** Per explicit instruction when Phase 2 was scoped ("a Podcast entity is optional at this stage; do not introduce it unless it is genuinely useful for the current ingestion flow"), it's been deferred — nothing in ingestion or processing needs to group episodes by podcast/channel yet. Channel metadata lives directly on `Episode`. Introduce `Podcast` when something actually needs it — most likely Phase 6 (browsing/filtering by podcast).
-- **No separate raw/cleaned `Transcript` rows.** The original sketch anticipated a raw/cleaned pair per §18. Instead, cleaning is applied at the *segment* level: `TranscriptSegment.text` (raw, immutable) and `TranscriptSegment.cleaned_text` (nullable, populated by `clean_transcript_segments`). This is the minimum schema addition that satisfies "raw remains recoverable, clean is a derived representation" (§3A.2/§3A.4 of the Phase 3A task) — one nullable column, not a second parallel table hierarchy. `cleaned_text` is safe to recompute/overwrite on a rerun because cleaning is a pure function of `text`.
+- **No persisted cleaned representation at all — not a `cleaned_text` column, not a separate table.** The original sketch anticipated a raw/cleaned pair per §18. An earlier version of this migration added a nullable `TranscriptSegment.cleaned_text` column; on review, that mixed raw source data with derived processing state on the canonical raw-transcript table for no concrete benefit — cleaning is cheap, deterministic, and pure, so recomputing it costs nothing, while persisting it risks silent staleness if the cleaning rules ever change without a backfill. Instead, `clean_transcript_segments()` (`app/services/cleaning_service.py`) returns a list of transient, in-memory `CleanedSegment` objects (`segment_id`, `sequence_number`, `text`, `start_ms`, `duration_ms`) that the chunker consumes directly and that are never written to the database on their own — only the chunker's output (`Chunk`, with `source_segment_ids` pointing back to the raw segments) is persisted. This keeps `TranscriptSegment` write-once raw provider output, full stop.
 - **`Chunk` has no join table for source-segment traceability.** `Chunk.source_segment_ids` is a plain `ARRAY(UUID)` column, not a `ChunkSegment` association table. Chunks are normally built from a contiguous range of segments, which a join table would model more "properly," but a single oversized segment can legitimately be split across two adjacent chunks (§8), so the same segment ID can appear in two chunks' arrays — an explicit array handles that with zero extra schema, a strict range (`first_segment_id`, `last_segment_id`) would not.
 
 ### IDs and timestamps (locked decisions)
@@ -184,14 +184,14 @@ Episode
 
 - **Episode**: `id`, `youtube_video_id` (unique, indexed), `youtube_url`, `title`/`description`/`channel_name`/`channel_id`/`thumbnail_url`/`duration_seconds`/`published_at`/`language` (all nullable — populated from provider metadata, never fabricated), `status` (`ProcessingStatus` enum — see below), `last_error`, `created_at`, `updated_at`.
 - **Transcript**: `id`, `episode_id` (FK, unique — enforces 1:1), `language`, `created_at`, `updated_at`.
-- **TranscriptSegment**: `id`, `transcript_id` (FK, indexed), `sequence_number`, `text` (raw), `cleaned_text` (nullable), `start_ms`, `duration_ms`, `speaker` (nullable, never invented), `created_at`. Unique constraint on `(transcript_id, sequence_number)` — ordering guarantee + query index.
+- **TranscriptSegment**: `id`, `transcript_id` (FK, indexed), `sequence_number`, `text` (raw, write-once — no cleaned/derived column; see "Deviations" above), `start_ms`, `duration_ms`, `speaker` (nullable, never invented), `created_at`. Unique constraint on `(transcript_id, sequence_number)` — ordering guarantee + query index.
 - **Chunk**: `id`, `transcript_id` (FK, indexed), `episode_id` (FK, indexed — denormalized from transcript, avoids a join for the common "chunks for this episode" query), `sequence_number`, `text`, `start_ms`, `end_ms`, `source_segment_ids` (`ARRAY(UUID)`), `token_count` (approximate — see §8), `created_at`. Unique constraint on `(transcript_id, sequence_number)`.
 - **ProcessingJob**: `id`, `episode_id` (FK, indexed), `job_type` (`TRANSCRIPT_INGESTION` | `TRANSCRIPT_PROCESSING`), `status` (`PENDING`/`RUNNING`/`COMPLETED`/`FAILED`, indexed), `started_at`, `completed_at`, `error_message` (safe/sanitized — see §9), `created_at`, `updated_at`.
 
 ### Migrations
 
 1. `78e3d5ee683d` — initial schema (Episode, Transcript, TranscriptSegment, ProcessingJob).
-2. `9d7cf2188f5a` — adds `Chunk`, `TranscriptSegment.cleaned_text`, and the `TRANSCRIPT_PROCESSING` job type. Two things found by actually running `alembic downgrade`/`upgrade` cycles against a real Postgres, not just the forward migration: autogenerate doesn't detect new values on an existing Postgres native `ENUM` type (had to hand-add `ALTER TYPE job_type ADD VALUE`), and since there's no `ALTER TYPE ... DROP VALUE`, the add had to be written as `ADD VALUE IF NOT EXISTS` — otherwise a downgrade-then-upgrade cycle fails with "enum label already exists" on the second upgrade (the same class of bug as migration 1's enum-type-drop issue, different manifestation).
+2. `9d7cf2188f5a` — adds `Chunk` and the `TRANSCRIPT_PROCESSING` job type (originally also added `TranscriptSegment.cleaned_text`; removed from this same unmerged migration on review — see "Deviations" above — rather than left in place and reverted by a third migration). Two things found by actually running `alembic downgrade`/`upgrade` cycles against a real Postgres, not just the forward migration: autogenerate doesn't detect new values on an existing Postgres native `ENUM` type (had to hand-add `ALTER TYPE job_type ADD VALUE`), and since there's no `ALTER TYPE ... DROP VALUE`, the add had to be written as `ADD VALUE IF NOT EXISTS` — otherwise a downgrade-then-upgrade cycle fails with "enum label already exists" on the second upgrade (the same class of bug as migration 1's enum-type-drop issue, different manifestation). Re-verified after the `cleaned_text` removal: downgrade→upgrade and a repeated downgrade/upgrade cycle both leave a clean schema with no enum corruption.
 
 ### Processing status enum (§17)
 
@@ -266,8 +266,8 @@ mark job RUNNING
         ▼
 TranscriptProcessingService.run  -- app/services/transcript_processing_service.py
         │
-        ├─ clean_transcript_segments(transcript.segments)     -- sets .cleaned_text in place
-        ├─ chunk_transcript_segments(transcript.segments, config)  -- see §7/§8
+        ├─ clean_transcript_segments(transcript.segments)     -- returns list[CleanedSegment], no DB writes
+        ├─ chunk_transcript_segments(cleaned_segments, config)  -- see §7/§8
         ├─ ChunkRepository.replace_all(...)                    -- delete-then-insert (idempotency, see §7)
         │
         ▼
@@ -289,6 +289,8 @@ Why no separate `POST /episodes/{id}/process` endpoint (differs from the origina
 ## 7. Transcript processing: cleaning + source traceability (Phase 3A)
 
 `app/services/cleaning_service.py` — ✅ deterministic, rule-based, no LLM (§3A.3). `clean_segment_text()` handles, per segment, in isolation: whitespace/newline/tab normalization, removing space-before-punctuation, and stripping a small explicit allowlist of non-speech caption markers (`[Music]`, `[Applause]`, `[Laughter]`, `[Inaudible]`, `[Silence]`, `[Crosstalk]`) — deliberately *not* a blanket "strip anything bracketed," since arbitrary bracketed text could be real spoken/quoted content. A second function, `_dedupe_cross_segment_overlap()`, handles the one cross-segment case: auto-captions are often produced from a rolling audio window, so the tail of one caption and the head of the next can be the literal same words re-transcribed — an exact ≥3-word match is trimmed from the *following* segment. Within-segment word repetition ("no no", "very very") is deliberately left untouched — it could be real disfluency or emphasis, not an artifact, and removing it would risk exactly the "don't remove substantive content" violation the task warns against.
+
+`clean_transcript_segments()` returns `list[CleanedSegment]` — a transient, in-memory dataclass (`segment_id`, `sequence_number`, `text`, `start_ms`, `duration_ms`) — rather than mutating or persisting anything on the `TranscriptSegment` ORM model. `chunk_transcript_segments()` (`app/services/chunking_service.py`) then consumes that list directly: `Raw TranscriptSegment → clean_transcript_segments() → CleanedSegment (in memory) → chunk_transcript_segments() → persisted Chunk`. This was a deliberate correction during Phase 3A review: cleaning is cheap and pure, so there's no benefit to persisting its output (and a real risk of it going stale relative to `text` if the cleaning rules change), so nothing sits between the raw segment and the chunker except an in-memory value.
 
 Source traceability (§3A.2): every `Chunk.source_segment_ids` is the literal list of `TranscriptSegment.id`s its text was built from, in order, with duplicates only when a single long segment was split across two chunks (§8). This directly answers "which transcript segments produced this chunk" without a join — `backend/scripts/inspect_chunks.py` demonstrates it by mapping each chunk's IDs back to `sequence_number`s and printing them as a range (e.g. `[1..37]`).
 

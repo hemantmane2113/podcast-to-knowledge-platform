@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.config.settings import Settings
-from app.models.transcript_segment import TranscriptSegment
+from app.services.cleaning_service import CleanedSegment
 
 _SENTENCE_END_RE = re.compile(r"[.!?][\"')\]]?$")
 
@@ -164,10 +164,10 @@ def _split_long_text(text: str, max_tokens: int) -> list[str]:
     return final_pieces
 
 
-def _build_units(segments: list[TranscriptSegment], max_tokens: int) -> list[_Unit]:
+def _build_units(segments: list[CleanedSegment], max_tokens: int) -> list[_Unit]:
     units: list[_Unit] = []
     for index, segment in enumerate(segments):
-        text = segment.cleaned_text if segment.cleaned_text is not None else segment.text
+        text = segment.text
         if not text:
             continue
 
@@ -183,7 +183,7 @@ def _build_units(segments: list[TranscriptSegment], max_tokens: int) -> list[_Un
                 _Unit(
                     text=piece,
                     token_count=estimate_tokens(piece),
-                    segment_id=segment.id,
+                    segment_id=segment.segment_id,
                     segment_start_ms=segment.start_ms,
                     segment_end_ms=segment_end_ms,
                     is_last_piece_of_segment=is_last,
@@ -231,11 +231,11 @@ def _finalize_chunk(units: list[_Unit], sequence_number: int) -> ChunkCandidate:
 
 
 def chunk_transcript_segments(
-    segments: list[TranscriptSegment], config: ChunkingConfig
+    segments: list[CleanedSegment], config: ChunkingConfig
 ) -> list[ChunkCandidate]:
     """Segments must already be in transcript order (sequence_number
-    ascending) and already cleaned (cleaned_text populated) — this
-    function does not sort or clean.
+    ascending) and already cleaned (app/services/cleaning_service.py) —
+    this function does not sort or clean.
     """
     units = _build_units(segments, config.max_tokens)
     if not units:

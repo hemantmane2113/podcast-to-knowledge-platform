@@ -5,11 +5,18 @@ Every transform here is chosen to be unambiguously safe: it never removes
 or reorders words that could be substantive speech, only formatting noise
 and one well-defined transcription artifact (see `_dedupe_cross_segment_overlap`).
 
-`text` on TranscriptSegment is never touched. This module only ever
-computes and returns/sets `cleaned_text`.
+`TranscriptSegment.text` is raw provider output and is never touched or
+persisted-over here. Cleaning output is a transient in-memory
+`CleanedSegment` per segment, consumed directly by the chunker
+(app/services/chunking_service.py) — it is never written back onto the
+ORM model or persisted on its own, so there's no derived-state staleness
+risk if the cleaning rules change (see ARCHITECTURE.md's raw-vs-clean
+discussion).
 """
 
 import re
+from dataclasses import dataclass
+from uuid import UUID
 
 from app.models.transcript_segment import TranscriptSegment
 
@@ -82,21 +89,47 @@ def _dedupe_cross_segment_overlap(previous_cleaned: str, current_cleaned: str) -
     return " ".join(curr_words[best_overlap:]).strip()
 
 
-def clean_transcript_segments(segments: list[TranscriptSegment]) -> None:
-    """Sets `.cleaned_text` on every segment, in transcript order, in
-    place. Pure function of each segment's `.text` (plus the immediately
+@dataclass(frozen=True)
+class CleanedSegment:
+    """One segment's deterministically-cleaned text, transient and never
+    persisted on its own -- the chunker (chunking_service.py) consumes
+    these directly and only its output (Chunk, via source_segment_ids)
+    is written to the database. Carries `segment_id` so that traceability
+    survives the cleaning step.
+    """
+
+    segment_id: UUID
+    sequence_number: int
+    text: str
+    start_ms: int
+    duration_ms: int
+
+
+def clean_transcript_segments(segments: list[TranscriptSegment]) -> list[CleanedSegment]:
+    """Returns one CleanedSegment per input segment, in transcript order.
+    Pure function of each segment's `.text` (plus the immediately
     preceding segment's already-cleaned text, for overlap trimming) --
     running this twice on the same input produces the same output, which
     is what makes reprocessing safe (PRODUCT_SPEC.md §51/§75 idempotency).
 
-    Caller is responsible for committing; this only mutates ORM attributes.
+    Never mutates the input ORM objects.
     """
+    cleaned_segments: list[CleanedSegment] = []
     previous_cleaned = ""
     for segment in segments:
         cleaned = clean_segment_text(segment.text)
         cleaned = _dedupe_cross_segment_overlap(previous_cleaned, cleaned)
-        segment.cleaned_text = cleaned
+        cleaned_segments.append(
+            CleanedSegment(
+                segment_id=segment.id,
+                sequence_number=segment.sequence_number,
+                text=cleaned,
+                start_ms=segment.start_ms,
+                duration_ms=segment.duration_ms,
+            )
+        )
         # An empty result (e.g. a segment that was only "[Music]") still
         # updates previous_cleaned to "" so a following segment isn't
         # compared against stale, no-longer-adjacent text.
         previous_cleaned = cleaned
+    return cleaned_segments

@@ -2,12 +2,12 @@ import uuid
 
 import pytest
 
-from app.models.transcript_segment import TranscriptSegment
 from app.services.chunking_service import (
     ChunkingConfig,
     chunk_transcript_segments,
     estimate_tokens,
 )
+from app.services.cleaning_service import CleanedSegment
 
 
 def _seg(
@@ -17,19 +17,17 @@ def _seg(
     *,
     cleaned_text: str | None = None,
     sequence_number: int = 0,
-) -> TranscriptSegment:
-    return TranscriptSegment(
-        id=uuid.uuid4(),
-        transcript_id=uuid.uuid4(),
+) -> CleanedSegment:
+    return CleanedSegment(
+        segment_id=uuid.uuid4(),
         sequence_number=sequence_number,
-        text=text,
-        cleaned_text=cleaned_text if cleaned_text is not None else text,
+        text=cleaned_text if cleaned_text is not None else text,
         start_ms=start_ms,
         duration_ms=duration_ms,
     )
 
 
-def _sequential(*texts_and_gaps: tuple[str, int]) -> list[TranscriptSegment]:
+def _sequential(*texts_and_gaps: tuple[str, int]) -> list[CleanedSegment]:
     """Builds segments back-to-back in time, each followed by the given
     gap (ms) before the next one starts. texts_and_gaps is (text, gap_after_ms)."""
     segments = []
@@ -226,7 +224,7 @@ def test_long_uninterrupted_segment_is_split_on_sentence_boundaries() -> None:
     assert reconstructed == text
     # Both resulting chunks trace back to the one original segment.
     for chunk in chunks:
-        assert chunk.source_segment_ids == [segments[0].id]
+        assert chunk.source_segment_ids == [segments[0].segment_id]
 
 
 def test_single_long_sentence_with_no_punctuation_splits_on_words() -> None:
@@ -251,7 +249,7 @@ def test_source_segment_ids_match_contributing_segments_in_order() -> None:
     config = ChunkingConfig(min_tokens=1, target_tokens=1000, max_tokens=2000)
     chunks = chunk_transcript_segments(segments, config)
     assert len(chunks) == 1
-    assert chunks[0].source_segment_ids == [s.id for s in segments]
+    assert chunks[0].source_segment_ids == [s.segment_id for s in segments]
 
 
 def test_start_ms_and_end_ms_use_segment_boundaries() -> None:

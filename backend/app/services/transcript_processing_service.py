@@ -38,12 +38,13 @@ class TranscriptProcessingService:
         if transcript is None:
             raise TranscriptNotFoundError(f"Episode {episode_id} has no transcript to process")
 
-        # Mutates transcript.segments in place (sets .cleaned_text); the
-        # chunker below reads that same in-memory state directly, no
-        # flush needed before it runs.
-        clean_transcript_segments(transcript.segments)
+        # Cleaning returns transient in-memory CleanedSegments -- raw
+        # transcript.segments (and their .text) are never mutated. The
+        # chunker consumes that cleaned output directly; nothing about
+        # cleaning is persisted on its own.
+        cleaned_segments = clean_transcript_segments(transcript.segments)
 
-        candidates = chunk_transcript_segments(transcript.segments, self._config)
+        candidates = chunk_transcript_segments(cleaned_segments, self._config)
         await self._chunks.replace_all(
             transcript_id=transcript.id, episode_id=episode_id, candidates=candidates
         )

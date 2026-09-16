@@ -37,7 +37,7 @@ podcast-to-knowledge-platform/
 ├── .github/workflows/ci.yml   # backend pytest; frontend build + audit
 ├── backend/
 │   ├── pyproject.toml
-│   ├── alembic.ini, alembic/  # two migrations: Episode/Transcript/TranscriptSegment/ProcessingJob, then Chunk + cleaned_text
+│   ├── alembic.ini, alembic/  # two migrations: Episode/Transcript/TranscriptSegment/ProcessingJob, then Chunk
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── api/               # health, episodes (create/get/transcript)
@@ -76,7 +76,7 @@ The full target layout, with backend module responsibilities for later phases an
 - [x] Episode/Transcript/TranscriptSegment/Chunk/ProcessingJob persisted via SQLAlchemy + Alembic
 - [x] `POST /api/v1/episodes`, `GET /api/v1/episodes/{id}`, `GET /api/v1/episodes/{id}/transcript` — tested and verified against a real Postgres + Redis + live worker process, not just mocks
 - [x] Consistent API error model (`{"code", "message"}` with correct HTTP status), retry policy (max 3 attempts, non-retryable errors never retried), no partial persistence on failure
-- [x] Deterministic transcript cleaning (whitespace/punctuation normalization, rolling-caption-overlap dedup) — raw text never modified
+- [x] Deterministic transcript cleaning (whitespace/punctuation normalization, rolling-caption-overlap dedup) — raw text never modified, and cleaning's output is never persisted either: it's a transient in-memory `CleanedSegment` consumed directly by the chunker
 - [x] Hybrid chunking (pause-gap + sentence-boundary preference, size-constrained, safe mid-segment splitting for oversized text) — no embeddings, no naive fixed-token splitting
 - [x] Chunk persistence with full source-segment traceability, idempotent regeneration (delete-then-insert), auto-chained after ingestion
 - [x] `scripts/inspect_chunks.py` dev tool + a realistic synthetic transcript fixture used for a manual quality-inspection pass (which found and fixed a real chunk-boundary-quality bug)

@@ -17,8 +17,8 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """The transcript for an episode, as returned by the transcript provider.
 
     One episode has at most one Transcript (raw/normalized text; cleaning
-    is applied at the segment level via TranscriptSegment.cleaned_text, not
-    as a separate transcript row — see that model's docstring and
+    is a transient in-memory step over TranscriptSegment.text, not
+    persisted at all — see app/services/cleaning_service.py and
     ARCHITECTURE.md).
     """
 

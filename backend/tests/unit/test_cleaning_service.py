@@ -88,9 +88,9 @@ def test_trims_exact_rolling_caption_overlap_across_segments() -> None:
         _segment("scaling laws have changed how we think about", 0),
         _segment("how we think about model training", 1),
     ]
-    clean_transcript_segments(segments)
-    assert segments[0].cleaned_text == "scaling laws have changed how we think about"
-    assert segments[1].cleaned_text == "model training"
+    cleaned = clean_transcript_segments(segments)
+    assert cleaned[0].text == "scaling laws have changed how we think about"
+    assert cleaned[1].text == "model training"
 
 
 def test_short_overlap_below_threshold_is_not_trimmed() -> None:
@@ -100,9 +100,9 @@ def test_short_overlap_below_threshold_is_not_trimmed() -> None:
         _segment("that's true of course", 0),
         _segment("of course we should check", 1),
     ]
-    clean_transcript_segments(segments)
-    assert segments[0].cleaned_text == "that's true of course"
-    assert segments[1].cleaned_text == "of course we should check"
+    cleaned = clean_transcript_segments(segments)
+    assert cleaned[0].text == "that's true of course"
+    assert cleaned[1].text == "of course we should check"
 
 
 def test_no_overlap_leaves_segments_unchanged() -> None:
@@ -110,21 +110,23 @@ def test_no_overlap_leaves_segments_unchanged() -> None:
         _segment("first topic entirely", 0),
         _segment("second unrelated topic", 1),
     ]
-    clean_transcript_segments(segments)
-    assert segments[0].cleaned_text == "first topic entirely"
-    assert segments[1].cleaned_text == "second unrelated topic"
+    cleaned = clean_transcript_segments(segments)
+    assert cleaned[0].text == "first topic entirely"
+    assert cleaned[1].text == "second unrelated topic"
 
 
 def test_clean_transcript_segments_preserves_order_and_count() -> None:
     segments = [_segment(f"segment number {i}", i) for i in range(5)]
-    clean_transcript_segments(segments)
-    assert len(segments) == 5
-    for i, segment in enumerate(segments):
-        assert segment.cleaned_text == f"segment number {i}"
+    cleaned = clean_transcript_segments(segments)
+    assert len(cleaned) == 5
+    for i, segment in enumerate(cleaned):
+        assert segment.text == f"segment number {i}"
+        assert segment.sequence_number == i
+        assert segment.segment_id == segments[i].id
 
 
 def test_raw_text_is_never_mutated() -> None:
     segments = [_segment("  hello   [Music] world  ", 0)]
-    clean_transcript_segments(segments)
+    cleaned = clean_transcript_segments(segments)
     assert segments[0].text == "  hello   [Music] world  "
-    assert segments[0].cleaned_text == "hello world"
+    assert cleaned[0].text == "hello world"
