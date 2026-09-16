@@ -107,6 +107,10 @@ uvicorn app.main:app --reload      # API
 arq app.worker.settings.WorkerSettings   # worker, run in a separate terminal
 pytest                             # needs DATABASE_URL pointed at a real (test) Postgres — see tests/conftest.py
 python -m scripts.inspect_chunks <episode_id> [--full-text]   # dev/debug: print a transcript's chunks
+# From an environment that can reach api.supadata.ai (this repo's build/CI sandbox cannot,
+# see the status note above) -- validates cleaning+chunking against a real transcript
+# without touching Postgres/Redis/the DB, printing only statistics + truncated previews:
+SUPADATA_API_KEY=... python -m scripts.validate_real_transcript "<youtube_url>" [--full-text]
 
 # Frontend (requires Node 20+)
 cd frontend
