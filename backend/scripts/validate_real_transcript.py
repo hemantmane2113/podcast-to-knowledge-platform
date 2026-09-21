@@ -1,17 +1,18 @@
 """Real-Supadata Phase 3A validation script.
 
 This sandbox's network policy blocks api.supadata.ai (confirmed directly
--- see ARCHITECTURE.md's top-of-document caveat), so this script has never
-been run against a real transcript from here. It's meant to be run from an
-environment that CAN reach the real API, against a real long-form
+-- see ARCHITECTURE.md's top-of-document caveat). It's meant to be run
+from an environment that CAN reach the real API, against a real long-form
 podcast/video, to gather the empirical evidence needed to validate (or
 challenge) the Phase 3A chunking defaults.
 
 It needs only SUPADATA_API_KEY and network access -- no Postgres, no
-Redis, no arq worker. It calls the real SupadataTranscriptProvider directly
+Redis, no arq worker, and it never persists anything (no DB writes, no
+transcript storage). It calls the real SupadataTranscriptProvider directly
 and runs the exact same in-memory cleaning/chunking pipeline that
-TranscriptProcessingService uses (app/services/{cleaning,chunking}_service.py),
-without persisting anything to a database.
+TranscriptProcessingService uses (app/services/{cleaning,chunking}_service.py)
+completely unmodified -- this script is read-only diagnostics over that
+pipeline's output, never a second implementation of it.
 
 It prints statistics and short (truncated by default) text previews to
 stdout only -- it never writes the transcript or chunk text to a file, so
@@ -32,7 +33,33 @@ Usage:
 
 Pick a real, publicly accessible long-form podcast/video in the 1-2+ hour
 range for this -- that's the regime the CHUNK_TARGET_TOKENS=800 decision
-in the completion report needs real evidence for, not a short clip.
+needs real evidence for, not a short clip.
+
+--- Boundary diagnostics (why this file has a "pure calculation" section) ---
+
+Every chunk-to-chunk boundary is classified using only the finalized
+ChunkCandidate output plus the raw TranscriptSegment timestamps -- this
+script does NOT re-run or instrument chunk_transcript_segments()'s internal
+decision loop, so the classification below is a faithful *reconstruction*
+of the algorithm's own stated preference order (pause > sentence > forced),
+not a byte-exact replay of which branch fired. Two things fall out of the
+real segment data rather than the chunk's own start_ms/end_ms fields:
+
+1. A single raw segment whose text alone exceeds max_tokens is split into
+   multiple chunk-sized pieces (see chunking_service.py::_split_long_text),
+   and a forced split can land squarely on a chunk boundary -- the SAME
+   raw segment then legitimately appears as the last contributing segment
+   of chunk N and the first contributing segment of chunk N+1. Computing a
+   "gap" between a segment and itself always comes out negative (its own
+   -duration_ms), which is not a timestamp problem, just a degenerate case
+   of the gap formula -- this script detects and labels it distinctly
+   ("forced_segment_split") instead of reporting a nonsensical negative gap.
+2. Genuine overlapping raw timestamps between two DIFFERENT consecutive
+   segments (a known real-world artifact of rolling-window auto-captions --
+   see cleaning_service.py's cross-segment overlap dedup) would also
+   produce a negative gap, and unlike case 1 is worth flagging as a real
+   data-quality observation. find_raw_segment_overlaps() checks this
+   directly, transcript-wide, independent of chunk boundaries.
 """
 
 import argparse
@@ -41,12 +68,13 @@ import os
 import statistics
 import sys
 import uuid
+from dataclasses import dataclass
 
 from app.core.exceptions import TranscriptProviderError
 from app.models.transcript_segment import TranscriptSegment
 from app.providers.transcript.supadata import SupadataTranscriptProvider
-from app.services.chunking_service import ChunkingConfig, chunk_transcript_segments
-from app.services.cleaning_service import clean_transcript_segments
+from app.services.chunking_service import ChunkCandidate, ChunkingConfig, _ends_sentence, chunk_transcript_segments
+from app.services.cleaning_service import CleanedSegment, clean_transcript_segments
 
 # Mirrors app/config/settings.py's defaults -- deliberately not importing
 # Settings here, since that pulls in full app config validation (fails
@@ -59,6 +87,19 @@ _DEFAULT_OVERLAP_TOKENS = 0
 _DEFAULT_PAUSE_THRESHOLD_MS = 1500
 
 _DEFAULT_PREVIEW_CHARS = 200
+
+# (label, predicate) in check order -- first match wins. Matches the exact
+# buckets asked for in the Phase 3A validation-pass follow-up.
+_TOKEN_BUCKETS: list[tuple[str, "callable"]] = [
+    ("<500", lambda t: t < 500),
+    ("500-699", lambda t: 500 <= t <= 699),
+    ("700-799", lambda t: 700 <= t <= 799),
+    ("800-899", lambda t: 800 <= t <= 899),
+    ("900-999", lambda t: 900 <= t <= 999),
+    ("1000-1079", lambda t: 1000 <= t <= 1079),
+    ("1080-1199", lambda t: 1080 <= t <= 1199),
+    ("1200+", lambda t: t >= 1200),
+]
 
 
 def _fmt_ts(ms: int) -> str:
@@ -74,6 +115,172 @@ def _preview(text: str, chars: int, full_text: bool) -> str:
     if full_text or len(text) <= chars:
         return text
     return text[:chars] + "..."
+
+
+# ============================================================================
+# Pure calculation helpers -- no I/O, unit-tested in
+# tests/unit/test_validate_real_transcript.py.
+# ============================================================================
+
+
+@dataclass
+class SegmentOverlap:
+    """Two consecutive (by sequence_number) raw segments whose real
+    timestamps overlap: the earlier one's end_ms (start_ms + duration_ms)
+    is after the later one's start_ms."""
+
+    prev_sequence: int
+    next_sequence: int
+    overlap_ms: int
+
+
+def find_raw_segment_overlaps(segments: list[TranscriptSegment]) -> list[SegmentOverlap]:
+    """Transcript-wide check, independent of chunking: do any two
+    consecutive raw segments' timestamps genuinely overlap? Assumes
+    `segments` is already in sequence_number order (as built by
+    _build_segments / TranscriptRepository.create_with_segments)."""
+    overlaps: list[SegmentOverlap] = []
+    for i in range(1, len(segments)):
+        prev, curr = segments[i - 1], segments[i]
+        prev_end_ms = prev.start_ms + prev.duration_ms
+        if curr.start_ms < prev_end_ms:
+            overlaps.append(
+                SegmentOverlap(
+                    prev_sequence=prev.sequence_number,
+                    next_sequence=curr.sequence_number,
+                    overlap_ms=prev_end_ms - curr.start_ms,
+                )
+            )
+    return overlaps
+
+
+def segment_by_id_index(segments: list[TranscriptSegment]) -> dict[uuid.UUID, TranscriptSegment]:
+    return {s.id: s for s in segments}
+
+
+def chunk_contributing_segments(
+    chunk: ChunkCandidate, segment_by_id: dict[uuid.UUID, TranscriptSegment]
+) -> tuple[TranscriptSegment, TranscriptSegment]:
+    """The first and last raw segment (by sequence_number) that contributed
+    text to this chunk. Not simply source_segment_ids[0]/[-1]: that list is
+    in first-occurrence order during chunk assembly, which already matches
+    sequence order in practice, but sorting here makes that guarantee
+    explicit rather than incidental."""
+    contributing = sorted(
+        (segment_by_id[sid] for sid in chunk.source_segment_ids if sid in segment_by_id),
+        key=lambda s: s.sequence_number,
+    )
+    return contributing[0], contributing[-1]
+
+
+@dataclass
+class BoundaryInfo:
+    """Diagnostics for one chunk-to-chunk boundary (between chunk i and
+    chunk i+1). See the module docstring for how `mechanism` is derived
+    and why `gap_ms` is None for a forced mid-segment split."""
+
+    prev_chunk_sequence: int
+    next_chunk_sequence: int
+    prev_token_count: int
+    next_token_count: int
+    prev_last_segment_id: uuid.UUID
+    prev_last_segment_sequence: int
+    next_first_segment_id: uuid.UUID
+    next_first_segment_sequence: int
+    same_segment_split: bool
+    gap_ms: int | None
+    mechanism: str  # "pause" | "sentence" | "forced_max" | "forced_segment_split"
+    prev_reached_target: bool
+
+
+def compute_boundaries(
+    chunks: list[ChunkCandidate],
+    segments: list[TranscriptSegment],
+    cleaned: list[CleanedSegment],
+    config: ChunkingConfig,
+) -> list[BoundaryInfo]:
+    segment_by_id = segment_by_id_index(segments)
+    cleaned_text_by_id = {cs.segment_id: cs.text for cs in cleaned}
+
+    boundaries: list[BoundaryInfo] = []
+    for i in range(len(chunks) - 1):
+        prev_chunk, next_chunk = chunks[i], chunks[i + 1]
+        _, prev_last = chunk_contributing_segments(prev_chunk, segment_by_id)
+        next_first, _ = chunk_contributing_segments(next_chunk, segment_by_id)
+
+        same_segment_split = prev_last.id == next_first.id
+        if same_segment_split:
+            # A single oversized segment straddles this boundary (see the
+            # module docstring, case 1) -- "gap" against itself is
+            # meaningless, not a timestamp defect.
+            gap_ms = None
+            mechanism = "forced_segment_split"
+        else:
+            gap_ms = next_first.start_ms - (prev_last.start_ms + prev_last.duration_ms)
+            if gap_ms >= config.pause_threshold_ms:
+                mechanism = "pause"
+            elif _ends_sentence(cleaned_text_by_id.get(prev_last.id, "")):
+                mechanism = "sentence"
+            else:
+                mechanism = "forced_max"
+
+        boundaries.append(
+            BoundaryInfo(
+                prev_chunk_sequence=prev_chunk.sequence_number,
+                next_chunk_sequence=next_chunk.sequence_number,
+                prev_token_count=prev_chunk.token_count,
+                next_token_count=next_chunk.token_count,
+                prev_last_segment_id=prev_last.id,
+                prev_last_segment_sequence=prev_last.sequence_number,
+                next_first_segment_id=next_first.id,
+                next_first_segment_sequence=next_first.sequence_number,
+                same_segment_split=same_segment_split,
+                gap_ms=gap_ms,
+                mechanism=mechanism,
+                # The finalized chunk's token_count IS the accumulated size
+                # at the chosen cut point (chunking_service.py checks
+                # current_tokens >= target_tokens before treating a unit as
+                # a candidate boundary), so this reads that decision back
+                # from the output rather than approximating it.
+                prev_reached_target=prev_chunk.token_count >= config.target_tokens,
+            )
+        )
+    return boundaries
+
+
+def boundary_mechanism_summary(boundaries: list[BoundaryInfo]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for b in boundaries:
+        counts[b.mechanism] = counts.get(b.mechanism, 0) + 1
+    return counts
+
+
+def token_distribution(chunks: list[ChunkCandidate]) -> dict[str, int]:
+    counts = {label: 0 for label, _ in _TOKEN_BUCKETS}
+    for c in chunks:
+        for label, predicate in _TOKEN_BUCKETS:
+            if predicate(c.token_count):
+                counts[label] += 1
+                break
+    return counts
+
+
+def size_bands(chunks: list[ChunkCandidate], config: ChunkingConfig) -> dict[str, int]:
+    near_max_floor = config.max_tokens * 0.9
+    bands = {"below_target": 0, "target_to_90pct_max": 0, "at_or_above_90pct_max": 0}
+    for c in chunks:
+        if c.token_count < config.target_tokens:
+            bands["below_target"] += 1
+        elif c.token_count >= near_max_floor:
+            bands["at_or_above_90pct_max"] += 1
+        else:
+            bands["target_to_90pct_max"] += 1
+    return bands
+
+
+# ============================================================================
+# Provider I/O
+# ============================================================================
 
 
 async def _fetch(video_url: str, api_key: str):
@@ -105,6 +312,11 @@ def _build_segments(transcript) -> list[TranscriptSegment]:
         )
         for index, segment in enumerate(transcript.segments)
     ]
+
+
+# ============================================================================
+# Reporting (I/O -- everything above this line is pure and testable)
+# ============================================================================
 
 
 def _report_metadata(metadata) -> None:
@@ -143,6 +355,20 @@ def _report_transcript(
     else:
         print("Timestamp ordering: OK (non-decreasing start_ms throughout)")
 
+    overlaps = find_raw_segment_overlaps(segments)
+    if overlaps:
+        total_overlap_ms = sum(o.overlap_ms for o in overlaps)
+        print(
+            f"Raw segment timestamp overlaps: {len(overlaps)} consecutive pair(s) overlap "
+            f"(total {total_overlap_ms}ms across all of them)"
+        )
+        for o in overlaps[:10]:
+            print(f"    segment {o.prev_sequence} overlaps segment {o.next_sequence} by {o.overlap_ms}ms")
+        if len(overlaps) > 10:
+            print(f"    ... and {len(overlaps) - 10} more")
+    else:
+        print("Raw segment timestamp overlaps: none")
+
     print("\nRepresentative segments:")
     for label, idx in (
         ("early", len(segments) // 10),
@@ -160,22 +386,13 @@ def _report_transcript(
     print(f"\nTotal raw text size: {total_chars} chars / {total_words} words")
 
 
-def _report_chunks(
-    segments: list[TranscriptSegment],
-    cleaned,
-    chunks,
-    config: ChunkingConfig,
-    *,
-    preview_chars: int,
-    full_text: bool,
-) -> None:
+def _report_chunk_summary(chunks: list[ChunkCandidate], config: ChunkingConfig) -> None:
     print(
         f"\n=== Chunks (min={config.min_tokens} target={config.target_tokens} "
         f"max={config.max_tokens} overlap={config.overlap_tokens} "
         f"pause_threshold={config.pause_threshold_ms}ms) ==="
     )
     print(f"Chunk count: {len(chunks)}")
-
     if not chunks:
         print("(no chunks produced)")
         return
@@ -193,7 +410,30 @@ def _report_chunks(
         f"max={_fmt_ts(max(durations_ms))}"
     )
 
-    # --- source reconstruction / loss check ---
+    print("\nToken distribution:")
+    dist = token_distribution(chunks)
+    for label, count in dist.items():
+        pct = (count / len(chunks)) * 100
+        print(f"  {label:10} {count:4d}  ({pct:.1f}%)")
+
+    print("\nSize bands:")
+    bands = size_bands(chunks, config)
+    print(f"  below target                {bands['below_target']:4d}  ({bands['below_target'] / len(chunks) * 100:.1f}%)")
+    print(f"  target .. <90% of max       {bands['target_to_90pct_max']:4d}  ({bands['target_to_90pct_max'] / len(chunks) * 100:.1f}%)")
+    print(f"  >= 90% of max                {bands['at_or_above_90pct_max']:4d}  ({bands['at_or_above_90pct_max'] / len(chunks) * 100:.1f}%)")
+
+    trailing = chunks[-1]
+    print(
+        f"\nTrailing chunk: {trailing.token_count} tokens "
+        f"({'below min_tokens, expected for a trailing chunk' if trailing.token_count < config.min_tokens else 'at or above min_tokens'})"
+    )
+
+
+def _report_quality_checks(
+    segments: list[TranscriptSegment], cleaned: list[CleanedSegment], chunks: list[ChunkCandidate]
+) -> None:
+    print("\n=== Quality checks ===")
+
     original_words = " ".join(s.text for s in cleaned).split()
     reconstructed_words = " ".join(c.text for c in chunks).split()
     if original_words == reconstructed_words:
@@ -205,7 +445,6 @@ def _report_chunks(
             "reconstructed words. Investigate before trusting these chunks."
         )
 
-    # --- duplicate chunk text check ---
     seen: set[str] = set()
     duplicate_count = 0
     for c in chunks:
@@ -218,7 +457,6 @@ def _report_chunks(
         else f"Duplicate chunk text: {duplicate_count} chunk(s) share exact text with another"
     )
 
-    # --- source_segment_ids completeness check ---
     all_segment_ids = {s.id for s in segments}
     covered_ids: set = set()
     for c in chunks:
@@ -232,7 +470,48 @@ def _report_chunks(
         f"{len(unexplained_missing)} UNEXPLAINED)"
     )
 
-    # --- representative chunk boundaries ---
+
+def _report_segment_ranges(chunks: list[ChunkCandidate], segments: list[TranscriptSegment]) -> None:
+    print("\n=== Chunk source segment ranges (first/last contributing segment per chunk) ===")
+    segment_by_id = segment_by_id_index(segments)
+    for c in chunks:
+        first, last = chunk_contributing_segments(c, segment_by_id)
+        print(
+            f"  Chunk {c.sequence_number + 1:03d}: "
+            f"first=seq {first.sequence_number} ({first.id})  "
+            f"last=seq {last.sequence_number} ({last.id})"
+        )
+
+
+def _report_boundaries(boundaries: list[BoundaryInfo]) -> None:
+    print("\n=== Chunk boundaries ===")
+    if not boundaries:
+        print("(fewer than 2 chunks -- no boundaries to report)")
+        return
+
+    for b in boundaries:
+        gap_str = "N/A (forced mid-segment split)" if b.gap_ms is None else f"{b.gap_ms}ms"
+        print(
+            f"  Boundary {b.prev_chunk_sequence + 1:03d} -> {b.next_chunk_sequence + 1:03d}: "
+            f"prev_tokens={b.prev_token_count} next_tokens={b.next_token_count} "
+            f"gap={gap_str} mechanism={b.mechanism} "
+            f"prev_reached_target={b.prev_reached_target}"
+        )
+        print(
+            f"      prev_last_segment=seq {b.prev_last_segment_sequence} ({b.prev_last_segment_id})  "
+            f"next_first_segment=seq {b.next_first_segment_sequence} ({b.next_first_segment_id})"
+        )
+
+    print("\nBoundary mechanism summary:")
+    summary = boundary_mechanism_summary(boundaries)
+    total = len(boundaries)
+    for mechanism, count in summary.items():
+        print(f"  {mechanism:22} {count:4d}  ({count / total * 100:.1f}%)")
+
+
+def _report_representative_chunks(
+    chunks: list[ChunkCandidate], config: ChunkingConfig, *, preview_chars: int, full_text: bool
+) -> None:
     print("\n=== Representative chunk boundaries ===")
     indices = sorted(
         {0, len(chunks) // 4, len(chunks) // 2, (3 * len(chunks)) // 4, len(chunks) - 1}
@@ -245,28 +524,10 @@ def _report_chunks(
         )
         print(f"    {_preview(c.text, preview_chars, full_text)!r}")
 
-    # --- chunks near the max-token ceiling ---
     near_max = [c for c in chunks if c.token_count >= config.max_tokens * 0.9]
     print(f"\nChunks within 90% of max_tokens ({config.max_tokens}): {len(near_max)}")
     for c in near_max[:10]:
         print(f"  Chunk {c.sequence_number + 1:03d}: {c.token_count} tokens")
-
-    # --- boundary pause analysis: did each cut land on a real pause? ---
-    print("\n=== Boundary pause analysis (does each cut align with a real pause?) ===")
-    for i in range(len(chunks) - 1):
-        gap_ms = chunks[i + 1].start_ms - chunks[i].end_ms
-        signal = "PAUSE" if gap_ms >= config.pause_threshold_ms else "no-pause (sentence/forced cut)"
-        print(
-            f"  Boundary {chunks[i].sequence_number + 1:03d} -> "
-            f"{chunks[i + 1].sequence_number + 1:03d}: gap={gap_ms}ms [{signal}]"
-        )
-
-    # --- trailing chunk check ---
-    trailing = chunks[-1]
-    print(
-        f"\nTrailing chunk: {trailing.token_count} tokens "
-        f"({'below min_tokens, expected for a trailing chunk' if trailing.token_count < config.min_tokens else 'at or above min_tokens'})"
-    )
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -293,9 +554,13 @@ async def _run(args: argparse.Namespace) -> None:
         pause_threshold_ms=args.pause_threshold_ms,
     )
     chunks = chunk_transcript_segments(cleaned, config)
-    _report_chunks(
-        segments, cleaned, chunks, config, preview_chars=args.preview_chars, full_text=args.full_text
-    )
+
+    _report_chunk_summary(chunks, config)
+    _report_quality_checks(segments, cleaned, chunks)
+    _report_representative_chunks(chunks, config, preview_chars=args.preview_chars, full_text=args.full_text)
+    _report_segment_ranges(chunks, segments)
+    boundaries = compute_boundaries(chunks, segments, cleaned, config)
+    _report_boundaries(boundaries)
 
 
 def main() -> None:
