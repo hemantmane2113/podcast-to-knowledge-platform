@@ -10,12 +10,17 @@ Phase 3A has exactly one thing to do after a transcript exists.
 import logging
 import uuid
 
+from app.ai.graph import run_article_pipeline
+from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config import get_settings
 from app.core.db import get_sessionmaker
+from app.core.exceptions import ChunksNotFoundError, TranscriptNotFoundError
 from app.models.episode import ProcessingStatus
 from app.models.processing_job import JobType
+from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.episode_repository import EpisodeRepository
 from app.repositories.processing_job_repository import ProcessingJobRepository
+from app.repositories.transcript_repository import TranscriptRepository
 from app.services.chunking_service import ChunkingConfig
 from app.services.ingestion_service import IngestionService
 from app.services.transcript_processing_service import TranscriptProcessingService
@@ -25,6 +30,7 @@ logger = logging.getLogger(__name__)
 MAX_TRIES = 3
 _GENERIC_FAILURE_MESSAGE = "Transcript ingestion failed. See server logs for details."
 _GENERIC_PROCESSING_FAILURE_MESSAGE = "Transcript processing failed. See server logs for details."
+_GENERIC_ARTICLE_FAILURE_MESSAGE = "Article generation failed. See server logs for details."
 
 
 async def ingest_episode_transcript(ctx: dict, episode_id: str, job_id: str) -> None:
@@ -167,6 +173,109 @@ async def process_transcript(ctx: dict, episode_id: str, job_id: str) -> None:
             await session.commit()
 
         logger.info("Generated %s chunks for episode %s", chunk_count, episode_id)
+
+
+async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
+    """arq entrypoint for the Phase C-H AI pipeline (app/ai/graph.py).
+
+    Deliberately NOT auto-chained after process_transcript (unlike
+    ingestion -> processing): this makes paid LLM calls, so it's only
+    ever enqueued by an explicit POST /episodes/{id}/generate-article
+    (see app/api/v1/articles.py).
+    """
+    episode_uuid = uuid.UUID(episode_id)
+    job_uuid = uuid.UUID(job_id)
+
+    llm_provider = ctx.get("llm_provider")
+    session_factory = get_sessionmaker()
+
+    async with session_factory() as session:
+        if llm_provider is None:
+            await _mark_failed(
+                session,
+                episode_uuid,
+                job_uuid,
+                "LLM provider is not configured (check LLM_PROVIDER and its API key).",
+            )
+            return
+
+        jobs = ProcessingJobRepository(session)
+        job = await jobs.get_by_id(job_uuid)
+        if job is not None:
+            jobs.mark_running(job)
+            await session.commit()
+
+        settings = get_settings()
+
+        try:
+            transcripts = TranscriptRepository(session)
+            transcript = await transcripts.get_by_episode_id(episode_uuid)
+            if transcript is None:
+                raise TranscriptNotFoundError(f"Episode {episode_uuid} has no transcript")
+
+            chunks = await ChunkRepository(session).get_by_transcript_id(transcript.id)
+            if not chunks:
+                raise ChunksNotFoundError(
+                    f"Episode {episode_uuid} has no chunks yet -- run transcript processing first"
+                )
+
+            deps = PipelineDeps(session=session, llm_provider=llm_provider, settings=settings)
+            initial_state: ArticlePipelineState = {
+                "episode_id": episode_uuid,
+                "transcript_id": transcript.id,
+                "chunks": chunks,
+                "transcript_word_count": sum(len(c.text.split()) for c in chunks),
+                "revision_count": 0,
+                "max_revision_attempts": settings.max_revision_attempts,
+            }
+            final_state = await run_article_pipeline(deps, initial_state)
+        except Exception as exc:
+            await session.rollback()
+
+            is_final_attempt = ctx.get("job_try", 1) >= MAX_TRIES
+            retryable = getattr(exc, "retryable", True)
+
+            if retryable and not is_final_attempt:
+                logger.warning(
+                    "Article generation attempt %s failed for episode %s (will retry): %s",
+                    ctx.get("job_try"),
+                    episode_id,
+                    _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE),
+                )
+                raise  # arq retries the task
+
+            logger.error(
+                "Article generation failed permanently for episode %s after %s attempt(s): %s",
+                episode_id,
+                ctx.get("job_try"),
+                _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE),
+            )
+            await _mark_failed(
+                session, episode_uuid, job_uuid, _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE)
+            )
+            return
+
+        episodes = EpisodeRepository(session)
+        episode = await episodes.get_by_id(episode_uuid)
+        if episode is not None:
+            # READY_FOR_REVIEW regardless of whether validation passed --
+            # a failing article still needs to reach a reviewable state
+            # (Phase I), not be silently dropped. The validation result
+            # itself (persisted by the validation node) tells a reviewer
+            # which checks failed.
+            episodes.set_status(episode, ProcessingStatus.READY_FOR_REVIEW)
+
+        job = await jobs.get_by_id(job_uuid)
+        if job is not None:
+            jobs.mark_completed(job)
+        await session.commit()
+
+        logger.info(
+            "Generated article for episode %s (validation passed=%s, revisions=%s)",
+            episode_id,
+            final_state["validation_report"].passed,
+            final_state.get("revision_count", 0),
+        )
 
 
 async def _mark_failed(session, episode_id: uuid.UUID, job_id: uuid.UUID, message: str) -> None:

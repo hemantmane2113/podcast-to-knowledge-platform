@@ -1,0 +1,232 @@
+"""Tests for the LLMProvider abstraction (app/providers/llm/):
+- factory selection + provider-specific key requirements
+- structured-output JSON parsing + one-shot retry, exercised against a
+  mocked chat-completions client (no real SDK network call).
+
+app/providers/llm/groq_provider.py, openai_provider.py, and
+opensource_provider.py are thin wrappers around
+_chat_completions.ChatCompletionsProvider -- these tests exercise that
+shared logic directly rather than duplicating it per concrete provider.
+"""
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from pydantic import BaseModel
+
+from app.config.settings import Settings
+from app.core.exceptions import LLMProviderAuthError, LLMStructuredOutputError
+from app.providers.llm._chat_completions import ChatCompletionsProvider
+from app.providers.llm.factory import get_llm_provider
+from app.providers.llm.groq_provider import GroqProvider
+from app.providers.llm.openai_provider import OpenAIProvider
+from app.providers.llm.opensource_provider import OpenSourceProvider
+
+
+class _Example(BaseModel):
+    title: str
+    count: int
+
+
+def _fake_completion(content: str) -> SimpleNamespace:
+    # Mimics the subset of an OpenAI/Groq ChatCompletion response object
+    # that _chat_completions.py actually reads.
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+
+class _StubChatCompletionsProvider(ChatCompletionsProvider):
+    """A minimal concrete ChatCompletionsProvider for testing the shared
+    generate/generate_structured logic without a real SDK client."""
+
+    def __init__(self, client):
+        self._client = client
+        self._model = "stub-model"
+
+    def _map_exception(self, exc: Exception) -> Exception:
+        return exc
+
+
+# --- factory: provider selection + key requirements -------------------------------
+
+
+def test_factory_selects_groq_by_default() -> None:
+    settings = Settings(_env_file=None, app_env="development", llm_provider="groq", groq_api_key="k", llm_model="m")
+    assert isinstance(get_llm_provider(settings), GroqProvider)
+
+
+def test_factory_selects_openai() -> None:
+    settings = Settings(_env_file=None, app_env="development", llm_provider="openai", openai_api_key="k", llm_model="m")
+    assert isinstance(get_llm_provider(settings), OpenAIProvider)
+
+
+def test_factory_selects_opensource() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="opensource",
+        opensource_base_url="http://localhost:8080/v1",
+        llm_model="m",
+    )
+    assert isinstance(get_llm_provider(settings), OpenSourceProvider)
+
+
+def test_factory_raises_for_unknown_provider() -> None:
+    settings = Settings(_env_file=None, app_env="development", llm_provider="groq", groq_api_key="k", llm_model="m")
+    object.__setattr__(settings, "llm_provider", "not-a-provider")
+    with pytest.raises(ValueError, match="not-a-provider"):
+        get_llm_provider(settings)
+
+
+def test_groq_provider_requires_api_key() -> None:
+    with pytest.raises(LLMProviderAuthError):
+        GroqProvider(api_key="", model="m")
+
+
+def test_groq_provider_requires_model() -> None:
+    with pytest.raises(LLMProviderAuthError):
+        GroqProvider(api_key="k", model="")
+
+
+def test_opensource_provider_requires_base_url() -> None:
+    with pytest.raises(LLMProviderAuthError):
+        OpenSourceProvider(base_url="", model="m")
+
+
+def test_opensource_provider_does_not_require_an_api_key() -> None:
+    provider = OpenSourceProvider(base_url="http://localhost:8080/v1", model="m")
+    assert provider is not None
+
+
+# --- generate() ---------------------------------------------------------------------
+
+
+async def test_generate_returns_text_and_usage() -> None:
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=_fake_completion("hello"))))
+    )
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
+
+    assert response.text == "hello"
+    assert response.model == "stub-model"
+    assert response.usage.total_tokens == 15
+
+
+async def test_generate_wraps_client_exception_via_map_exception() -> None:
+    class _Provider(_StubChatCompletionsProvider):
+        def _map_exception(self, exc: Exception) -> Exception:
+            return RuntimeError(f"mapped: {exc}")
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(side_effect=ValueError("boom")))
+        )
+    )
+    provider = _Provider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    with pytest.raises(RuntimeError, match="mapped: boom"):
+        await provider.generate(messages=[LLMMessage(role="user", content="hi")])
+
+
+# --- generate_structured(): parsing, retry, schema mismatch -------------------------
+
+
+async def test_generate_structured_parses_valid_json_on_first_try() -> None:
+    valid_json = json.dumps({"title": "hello", "count": 3})
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=_fake_completion(valid_json)))
+        )
+    )
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+    )
+
+    assert result == _Example(title="hello", count=3)
+    assert client.chat.completions.create.call_count == 1
+
+
+async def test_generate_structured_retries_once_on_invalid_json_then_succeeds() -> None:
+    bad_then_good = [
+        _fake_completion("not json at all"),
+        _fake_completion(json.dumps({"title": "fixed", "count": 1})),
+    ]
+    create = AsyncMock(side_effect=bad_then_good)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+    )
+
+    assert result == _Example(title="fixed", count=1)
+    assert create.call_count == 2
+    # The retry prompt includes the bad output and an error explanation.
+    second_call_messages = create.call_args_list[1].kwargs["messages"]
+    assert any("not valid JSON" in m["content"] for m in second_call_messages)
+
+
+async def test_generate_structured_raises_after_two_failed_attempts() -> None:
+    create = AsyncMock(return_value=_fake_completion("still not json"))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    with pytest.raises(LLMStructuredOutputError):
+        await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+    assert create.call_count == 2
+
+
+async def test_generate_structured_rejects_json_missing_required_fields() -> None:
+    incomplete = json.dumps({"title": "missing count"})
+    complete = json.dumps({"title": "ok", "count": 2})
+    create = AsyncMock(side_effect=[_fake_completion(incomplete), _fake_completion(complete)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+    )
+    assert result == _Example(title="ok", count=2)
+    assert create.call_count == 2
+
+
+async def test_generate_structured_includes_json_schema_in_system_prompt() -> None:
+    create = AsyncMock(return_value=_fake_completion(json.dumps({"title": "x", "count": 0})))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="hi")],
+        response_model=_Example,
+        system="Be helpful.",
+    )
+
+    sent_messages = create.call_args_list[0].kwargs["messages"]
+    assert sent_messages[0]["role"] == "system"
+    assert "Be helpful." in sent_messages[0]["content"]
+    assert "\"title\"" in sent_messages[0]["content"]  # schema property present
+    assert create.call_args_list[0].kwargs["response_format"] == {"type": "json_object"}

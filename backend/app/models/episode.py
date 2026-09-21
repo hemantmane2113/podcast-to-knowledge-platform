@@ -1,10 +1,15 @@
 import enum
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, Enum, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.models.article import Article
+    from app.models.article_plan import ArticlePlan
 
 
 class ProcessingStatus(str, enum.Enum):
@@ -66,4 +71,10 @@ class Episode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     processing_jobs: Mapped[list["ProcessingJob"]] = relationship(
         back_populates="episode", cascade="all, delete-orphan"
+    )
+    article_plan: Mapped["ArticlePlan | None"] = relationship(
+        back_populates="episode", uselist=False, cascade="all, delete-orphan"
+    )
+    article: Mapped["Article | None"] = relationship(
+        back_populates="episode", uselist=False, cascade="all, delete-orphan"
     )

@@ -10,9 +10,9 @@ Every section below is written in the target/final tense (this is architecture, 
 - **🚧 PARTIAL** — some of it exists (e.g. the interface but not every implementation).
 - **⬜ PLANNED** — described here for context on where it's headed; no code yet.
 
-As of this revision: **Phase 1 (Foundation)**, **Phase 2 (Transcript Ingestion)**, and **Phase 3A (Transcript Cleaning + Chunking)** are ✅ IMPLEMENTED. Everything from Phase 3B onward (embeddings, retrieval, article generation, verification, RAG, LangGraph, the public reading UI, the real admin dashboard) is ⬜ PLANNED.
+As of this revision: **Phase 1 (Foundation)**, **Phase 2 (Transcript Ingestion)**, **Phase 3A (Transcript Cleaning + Chunking)**, and the **V1 AI pipeline (Phases C-H — topic analysis through a reviewable article, §17 below)** are ✅ IMPLEMENTED. pgvector/embeddings-based retrieval is deliberately **not** built (§17.7) — the architecture supports adding it later where it provides a clear benefit, but nothing in V1 needs it. The real editorial CMS and public reading experience are ⬜ PLANNED.
 
-**Important caveat on Phase 2/3A validation**: ingestion has been exercised against a *real* arq worker, *real* Redis, and *real* Postgres, but never against the *real* Supadata API — this sandboxed build environment's network egress policy blocks `api.supadata.ai` (confirmed directly: the proxy returns 403 on `CONNECT`). `SupadataTranscriptProvider` is fully implemented and thoroughly tested against a mocked HTTP layer (`respx`), and Phase 3A's cleaner/chunker have been run against a realistic hand-built fixture transcript, but **no real Supadata transcript content has been retrieved or validated from this environment.** That validation is expected to happen separately, from an environment that can reach `api.supadata.ai`.
+**Important caveat on real-provider validation**: this sandboxed build environment's network egress policy blocks `api.supadata.ai`, `api.groq.com`, and `api.openai.com` (confirmed directly). Phase 2/3A ingestion, cleaning, and chunking *have* been validated against a real Supadata transcript (a real ~2h47m podcast, via `scripts/validate_real_transcript.py` run from an unrestricted environment — see that script and the README status line for the numbers). The AI pipeline (§17) has been built and thoroughly tested against a `FakeLLMProvider` (`tests/fakes.py`) exercising the real persistence path end-to-end, but **no real LLM call has been made from this environment** — `tests/integration/test_article_pipeline_smoke.py` is the explicit, skip-by-default test to run that validation from an environment that can reach a real LLM provider.
 
 ---
 
@@ -133,8 +133,11 @@ class TranscriptProvider(ABC):                              # ✅ IMPLEMENTED
     async def get_metadata(self, video_url: str) -> EpisodeMetadata: ...
     async def get_transcript(self, video_url: str) -> NormalizedTranscript: ...
 
-class LLMProvider(ABC): ...                                  # ⬜ PLANNED (Phase 4)
-class EmbeddingProvider(ABC): ...                             # ⬜ PLANNED (Phase 3C — deliberately not introduced in 3A, see §8)
+class LLMProvider(ABC):                                       # ✅ IMPLEMENTED (§17.2)
+    async def generate(self, *, messages, system=None, temperature=0.2, max_tokens=None) -> LLMTextResponse: ...
+    async def generate_structured(self, *, messages, response_model, system=None, temperature=0.2, max_tokens=None): ...
+
+class EmbeddingProvider(ABC): ...                             # ⬜ PLANNED (deliberately not introduced yet — see §17.7)
 class StorageProvider(ABC): ...                                # ⬜ PLANNED (not yet needed — nothing binary to store)
 ```
 
@@ -143,6 +146,8 @@ class StorageProvider(ABC): ...                                # ⬜ PLANNED (no
 `SupadataTranscriptProvider` (`app/providers/transcript/supadata.py`) — ✅ implemented against Supadata's documented `/transcript` and `/metadata` endpoints (`x-api-key` auth, transparent 202/job-polling for large videos). **Correction history**: initially implemented with `mode=native` (only return transcripts that already exist as real captions, reasoned as closer to §88 "never invent"); corrected to `mode=auto` per explicit direction — `mode=auto` asks for native captions first and falls back to a generated transcript when a video has none, trading a small amount of that purity for actually getting a transcript on videos without official captions. `text=false` is non-negotiable either way — ingestion needs timestamped segments, not a plain string. One caveat, stated plainly in the module docstring: Supadata's own docs site was not directly fetchable from this build environment (network policy blocked it), so the exact response shape was assembled from third-party summaries of the documented behavior, not verified against a real call (see the top-of-document caveat). Parsing is defensive (`MalformedProviderResponseError` on anything unexpected) precisely because of that uncertainty.
 
 `services/` and `worker/` depend only on the abstract `TranscriptProvider` interface — `IngestionService` takes a `TranscriptProvider` in its constructor and has never imported `SupadataTranscriptProvider` or `httpx` directly; tests inject a `StubProvider` (`tests/fakes.py`) instead.
+
+`LLMProvider` (`app/providers/llm/`) follows the identical pattern for inference — see §17.2 for the full writeup (three concrete providers, structured-output handling, exception mapping, and why `app/ai/` never imports `groq`/`openai` directly).
 
 ---
 
@@ -436,13 +441,12 @@ This mirrors §97 and §101–105; each milestone is only started once the previ
 
 1. **Phase 1 — Foundation** ✅: repo scaffolding, Docker Compose, FastAPI skeleton with health check, Next.js skeleton, env config, CI, fail-fast settings.
 2. **Phase 2 — Ingestion** ✅ (§101, first functional milestone): YouTube URL validation → `SupadataTranscriptProvider` → metadata + transcript normalization → persisted to Postgres via an async job → queryable through the API. No AI processing.
-3. **Phase 3A — Cleaning + Chunking** ✅ (§102, first half): deterministic per-segment cleaning, hybrid pause/sentence/size chunking, chunk persistence with source traceability, auto-chained after ingestion. No embeddings, no chunk analysis.
-4. **Phase 3B/3C — Embeddings + Retrieval** ⬜ (§102, second half): `EmbeddingProvider`, pgvector columns, chunk-level embedding storage, semantic retrieval. First phase that needs pgvector.
-5. **Phase 4 — Intelligence** ⬜ (§103): conversation map → article plan → grounded section generation. First phase that needs `LLMProvider` and LangGraph.
-6. **Phase 5 — Verification** ⬜ (§104): claim extraction, fidelity verification, revision loop.
-7. **Phase 6 — UI** ⬜ (§105): homepage content, library, article page, the real admin dashboard, processing status UI. `frontend/app/dev/ingest` gets replaced, not extended.
-8. **Phase 7 — Q&A** ⬜: episode-filtered RAG question answering with timestamp citations.
-9. **Phase 8 — Evaluation** ⬜: evaluation dataset, metrics, regression tests, LLM cost tracking.
+3. **Phase 3A — Cleaning + Chunking** ✅ (§102, first half): deterministic per-segment cleaning, hybrid pause/sentence/size chunking, chunk persistence with source traceability, auto-chained after ingestion. No embeddings, no chunk analysis. Validated against a real ~2h47m podcast transcript.
+4. **V1 AI pipeline — Topic analysis through a reviewable article** ✅ (§17 below, covers what the original sketch's Phases 3B-6 described, built as one V1 pass rather than staged phases): `LLMProvider` abstraction (Groq/OpenAI/self-hosted), topic analysis, article planning, section-by-section generation, deterministic validation, a bounded revision loop, and a minimal review API/UI. Explicitly **not** including pgvector/embeddings-based retrieval (§17.7 — not needed at this scale) or fidelity verification beyond the deterministic checks (LLM-based validation exists as an optional, off-by-default supplementary signal only).
+5. **Real end-to-end validation against a real LLM + real Supadata data** ⬜: next step — this sandbox cannot reach either provider (see the top-of-document caveat); `tests/integration/test_article_pipeline_smoke.py` and the real worker/API path are ready for it.
+6. **The real editorial CMS + public reading experience** ⬜: homepage content, library, article page, the real admin dashboard. `frontend/app/dev/review/[episodeId]` gets replaced, not extended.
+7. **Semantic retrieval / Q&A** ⬜: only once a concrete need for it is demonstrated against real generated articles (§17.7).
+8. **Evaluation** ⬜: evaluation dataset, metrics, regression tests, LLM cost tracking.
 
 Definition of done for the MVP as a whole is the checklist in §106 of the product spec.
 
@@ -453,8 +457,130 @@ Definition of done for the MVP as a whole is the checklist in §106 of the produ
 - **Object storage implementation**: local filesystem for development vs an S3-compatible provider — `StorageProvider` still doesn't exist because nothing binary needs storing yet (transcripts are text, in Postgres).
 - **Admin auth mechanism**: simplest viable (a single admin credential + session/JWT) vs a fuller auth provider. `ADMIN_AUTH_SECRET` is reserved and required outside dev, but unused — needs an actual decision before Phase 6 adds admin-only mutations.
 - **`Podcast` entity**: deferred (see §5) until something needs to group episodes by channel/podcast.
-- **Real tokenizer**: `estimate_tokens()` (§8) is a `chars/4` approximation. Replace with a real tokenizer (e.g. `tiktoken` or whatever matches the chosen `LLMProvider`) once Phase 4 picks a concrete model — the chunker's structure doesn't need to change, only that one function.
-- **Chunk-level embeddings and `EmbeddingProvider`**: deferred to Phase 3C by explicit instruction (§8) — not forced by anything in Phase 3A.
+- **Real tokenizer**: `estimate_tokens()` (§8) is a `chars/4` approximation, still true after §17 — every prompt/structured-output size decision in `app/ai/` reuses it rather than a real tokenizer, since no concrete model/tokenizer has been benchmarked against real generation yet. Replace once one has; nothing else in the pipeline's structure needs to change.
+- **Chunk-level embeddings and `EmbeddingProvider`**: still deliberately not introduced (§17.7) — add if/when semantic retrieval is actually needed against real generated articles, not preemptively.
 - **`Chunk` vector column / pgvector**: deferred alongside embeddings.
+- **Per-task model assignment**: V1 uses one `LLM_MODEL` for topic analysis, planning, generation, and validation (§17.4) — assign different models per task once there's real quality/cost/latency data to base that on, not before.
+
+---
+
+## 17. AI pipeline: article generation (Phases C-H)
+
+```
+Chunk (Phase 3A, unchanged)
+   |
+   v
+topic_analysis  --LLM, structured, batched-->  Topic (persisted, separate from Chunk)
+   |
+   v
+planning        --LLM, structured-->           ArticlePlan (persisted independently)
+   |
+   v
+section_generation --LLM, structured, per-section--> Article + ArticleSection (persisted)
+   |
+   v
+validation      --deterministic (+ optional LLM)--> ValidationResult (persisted)
+   |
+   +--fails, revisions remain--> revision (regenerate only the flagged sections) --> back to validation
+   |
+   +--passes, or revisions exhausted--> Episode.status = READY_FOR_REVIEW
+```
+
+This is `app/ai/graph.py` — the one place in the codebase LangGraph is used (§1: "AI workflow → LangGraph; CRUD/DB workflows → normal services"). Ingestion, transcript processing, and the review API are all plain services/repositories, unchanged by this section.
+
+### 17.1 Why canonical chunks aren't article sections
+
+A `Chunk` (§8) is a *source-oriented* unit: sized to a token budget, cut at whichever pause/sentence boundary is nearest, with no notion of what it's "about". An article section is a *meaning-oriented* unit: however many chunks it takes to cover one coherent idea. Collapsing the two would mean either chunk sizes dictate article structure (arbitrary) or article structure dictates chunk sizes (breaks Phase 3A's token-budget guarantees). `Topic` (§17.3) is the explicit middle layer: several chunks group into one topic, several topics group into one planned section — both mappings are `ARRAY(UUID)` columns, the same "array, not join table" pattern as `Chunk.source_segment_ids` (§5), for the same reason: a chunk or topic near a boundary can legitimately belong to more than one grouping.
+
+### 17.2 `LLMProvider` (`app/providers/llm/`)
+
+```python
+class LLMProvider(ABC):                                                    # ✅
+    async def generate(self, *, messages, system=None, temperature=0.2, max_tokens=None) -> LLMTextResponse: ...
+    async def generate_structured(self, *, messages, response_model: type[T], system=None, temperature=0.2, max_tokens=None) -> T: ...
+
+GroqProvider(ChatCompletionsProvider)        # ✅ AsyncGroq
+OpenAIProvider(ChatCompletionsProvider)      # ✅ AsyncOpenAI
+OpenSourceProvider(ChatCompletionsProvider)  # ✅ AsyncOpenAI pointed at a custom base_url
+```
+
+All three subclass `_chat_completions.ChatCompletionsProvider`, which implements `generate`/`generate_structured` once against any client exposing an OpenAI-style `client.chat.completions.create(...)` method — Groq's Python SDK uses that exact shape (its API is OpenAI-compatible), and a self-hosted OpenAI-compatible server (vLLM, Ollama, TGI) needs no fourth SDK, just the `openai` client with a different `base_url`. Each subclass only supplies client construction and exception-class mapping (its own `AuthenticationError`/`RateLimitError`/`APIConnectionError` → `LLMProviderAuthError`/`LLMProviderRateLimitError`/`LLMProviderError`, mirroring `TranscriptProviderError`'s hierarchy in `app/core/exceptions.py`). This was a deliberate late simplification: an earlier version had each provider re-implement `generate`/`generate_structured` (three near-identical copies) — collapsed into the shared base once three real, concrete duplicates existed, not preemptively.
+
+**Structured output** is JSON-mode (`response_format={"type": "json_object"}`) plus the target Pydantic model's JSON Schema embedded in the system prompt, parsed with `model_validate_json`, with **one** good-faith retry (the bad output + validation error fed back to the model) before raising `LLMStructuredOutputError`. This was chosen over OpenAI's newer strict `json_schema` mode specifically because it works identically across all three providers — Groq doesn't support that stricter mode on every model, and the self-hosted case can be any server — "provider/model agnostic" (the task's own requirement) ruled out anything provider-specific.
+
+**Selection** (`app/providers/llm/factory.py`): `get_llm_provider(settings)` reads `LLM_PROVIDER` (`groq` | `openai` | `opensource`) and constructs the matching concrete provider with `LLM_MODEL` and that provider's own key — `Settings._require_secrets_outside_development` only requires the *selected* provider's key outside development (`_LLM_PROVIDER_KEY_FIELD` in `app/config/settings.py`), never all three. `app/ai/` and `app/worker/` depend on `LLMProvider` and the factory only; no `groq`/`openai` import outside `app/providers/llm/`.
+
+**Chunk/topic references in prompts**: every structured schema in `app/ai/schemas.py` (`TopicAnalysisResult`, `ArticlePlanResult`, `GeneratedSection`) refers to chunks/topics by small integers (a chunk's position in the batch, a topic's own `sequence_number`) — models reliably mangle or hallucinate UUIDs but handle small integers correctly. `app/ai/nodes/` resolves every integer back to a real database UUID before anything is persisted; nothing is ever written to the database on the strength of a model-generated ID.
+
+### 17.3 Data model additions
+
+```
+Episode
+   ├── Transcript (1:1)
+   │       ├── TranscriptSegment (ordered)                     ✅
+   │       ├── Chunk (ordered)                                 ✅
+   │       └── Topic (ordered)                                 ✅  chunk_ids: ARRAY(UUID), key_claims: JSONB
+   ├── ArticlePlan (1:1)                                        ✅  sections: JSONB (see below)
+   ├── Article (1:1)                                            ✅
+   │       ├── ArticleSection (ordered)                         ✅  supporting_chunk_ids/supporting_topic_ids: ARRAY(UUID)
+   │       └── ValidationResult (many, kept — not replaced)     ✅  checks: JSONB
+   └── ProcessingJob (1:many)                                   ✅  + JobType.ARTICLE_GENERATION
+```
+
+- **Topic**: `id`, `transcript_id`/`episode_id` (FK, indexed — same denormalization as `Chunk.episode_id`), `sequence_number`, `title`, `summary`, `chunk_ids` (`ARRAY(UUID)`), `key_claims` (`JSONB` — list of `{text, speaker, claim_type}`), `subtopics` (`ARRAY(Text)`), `created_at`. Regenerated whole (delete + reinsert) each time topic analysis runs, same idempotency strategy as `Chunk` (`TopicRepository.replace_all`).
+- **ArticlePlan**: `id`, `episode_id` (FK, unique — 1:1, like `Transcript`), `title`, `introduction_summary`, `conclusion_summary`, `sections` (`JSONB` list of planned sections). `JSONB`, not a child table, for the same reason as `Topic.key_claims`: only ever read/written as a whole alongside its parent, never queried independently in V1.
+- **Article**: `id`, `episode_id` (FK, unique), `article_plan_id` (FK), `title`, `revision_count`. Deleting `ArticlePlan` cascades to `Article` (`ondelete='CASCADE'` on `article_plan_id`) — deliberate: a plan regeneration invalidates whatever article was built from the old plan, and the pipeline regenerates the article from the new plan immediately after anyway.
+- **ArticleSection**: `id`, `article_id` (FK, indexed), `sequence_number`, `heading`, `content`, `supporting_chunk_ids`/`supporting_topic_ids` (`ARRAY(UUID)`, unique constraint on `(article_id, sequence_number)`). This is Phase D's evidence-grounding layer made concrete: "article section → supporting chunks → transcript segments → timestamps" is a direct field lookup, no join, no retrieval step.
+- **ValidationResult**: `id`, `article_id` (FK, indexed), `passed` (bool, denormalized AND of `checks`), `checks` (`JSONB`). **Not** delete-then-replace like every other repository here — each validation run (including the ones between revision attempts) is kept as its own row, so a reviewer or the revision node itself can see the before/after history across a revision loop.
+- **`JobType.ARTICLE_GENERATION`**: added via `ALTER TYPE job_type ADD VALUE IF NOT EXISTS` (same migration pattern as every prior `JobType`/enum addition — see §6/migration history). One job type covers the whole graph (topic analysis through validation/revision), not one job per stage, matching how `TRANSCRIPT_PROCESSING` already covers cleaning + chunking as a single job.
+
+Migration: `6c806f44935d_add_article_generation_pipeline_models` — verified with the same downgrade/upgrade round-trip discipline as every prior migration (full cycle + a `-1`/upgrade cycle, no enum corruption).
+
+### 17.4 Model selection
+
+One `LLM_MODEL` drives topic analysis, planning, section generation, and (if enabled) validation in V1 — not because the architecture can't support per-task models (`PipelineDeps`/`LLMProvider` are already per-call, so a future `deps.llm_provider_for(task)` is a small change, not a redesign), but because assigning different models per task before there's real quality/cost/latency data to base it on would be premature optimization. Benchmark against real generated articles first (§16), then split if the data supports it.
+
+### 17.5 LangGraph design
+
+`app/ai/state.py::ArticlePipelineState` (a `TypedDict`) is the graph's state; `PipelineDeps` (session, `LLMProvider`, `Settings` — plus the repositories built from them) is threaded through every node via closures (`nodes/*.py::build(deps) -> node_fn`), not through graph state itself, since it's infrastructure, not pipeline data. **No checkpointer is configured** — this compiles to a plain in-process graph for one arq job invocation; Postgres (via each node's own repository writes, one commit per node) is already the durability layer, and a crash mid-run is handled by arq's existing retry policy (`MAX_TRIES`, §6), the same as every other job in this codebase. Wiring up LangGraph's own persistence/checkpointing would duplicate that for no benefit — the "don't overbuild" instruction this pipeline was built under ruled it out explicitly.
+
+Each node commits its own work before returning (topic analysis persists `Topic` rows, planning persists `ArticlePlan`, section generation persists `Article`+`ArticleSection`, validation persists `ValidationResult`) and updates `Episode.status` at the point it starts (`ANALYZING` → `PLANNING` → `GENERATING` → `VERIFYING` → `REVISING` if a revision loop triggers) — so `GET /episodes/{id}` reflects real progress mid-run, not just a single opaque "processing" state.
+
+**Topic-analysis batching** (`app/ai/nodes/topic_analysis.py`): chunks are grouped into batches under `TOPIC_ANALYSIS_TOKEN_BUDGET` (`estimate_tokens()`-based, default 12000), each batch analyzed independently with chunk indices numbered globally (not reset per batch, so no renumbering is needed afterward), and — only if there was more than one batch — one additional merge call reconciles topics that may have split across a batch boundary. A single-batch transcript skips the merge call entirely.
+
+**Revision loop** (`app/ai/nodes/revision.py`): bounded by `MAX_REVISION_ATTEMPTS` (existing setting, §13). On a failed validation, a regex over each failing check's own `details` text (`"section N"`) identifies which section(s) to regenerate — every `article_validation.py` check that can name a specific section does so in that exact phrasing precisely so this targeting works; a check with no section-specific phrasing (e.g. overall article length) becomes shared feedback appended to whichever sections *do* get regenerated, and if no check names any section at all, every section is regenerated rather than guessing. Regeneration reuses `section_generation.generate_section()` directly — the revision path is not a second implementation of section generation, only a different call site with extra feedback in the prompt.
+
+### 17.6 Deterministic validation (`app/services/article_validation.py`)
+
+Ten pure-Python, LLM-free checks (no DB session, no network) — this is Phase H's reliability backbone, independently unit-tested (`tests/unit/test_article_validation.py`) without needing a database or a model call:
+
+1. **source_coverage** — what fraction of the transcript's chunks are cited by at least one section (reported always; fails only on zero coverage — not every chunk must be cited).
+2. **source_traceability** — every `supporting_chunk_id` resolves to a real `Chunk`.
+3. **no_empty_sections** — heading and content (≥ a minimum length) are actually present.
+4. **no_duplicate_sections** — no two sections share a heading or content.
+5. **no_duplicate_paragraphs** — no paragraph (above a trivial-length floor) repeats across sections.
+6. **no_missing_planned_sections** — every `ArticlePlan` section produced a generated `ArticleSection`.
+7. **article_length** — generated word count vs. `ARTICLE_MAX_LENGTH_RATIO` of the transcript's word count (the product goal — "substantially shorter" — as a soft, reported ratio, plus a hard floor against an essentially-empty generation).
+8. **unsupported_content** — flags a section with *no* `supporting_chunk_ids` or `supporting_topic_ids` at all; a structural proxy for "unsupported claims" (true claim-level fidelity checking needs an LLM/NLP judge, explicitly out of scope for a deterministic check).
+9. **invalid_source_references** — every `supporting_topic_id`, on sections and on the plan itself, resolves to a real `Topic`.
+10. **broken_timestamp_references** — every cited chunk's `start_ms`/`end_ms` are non-negative and ordered correctly.
+
+An **optional** LLM-based coherence review (`ENABLE_LLM_VALIDATION`, off by default) is appended to the persisted `checks` list as pure supplementary information — it never contributes to `ValidationReport.passed`, and a failure to even run it (provider error) is swallowed, never fails the pipeline. "Never a replacement for the deterministic checks" (the task's own requirement) is enforced structurally: `article_validation.py` has no LLM import at all.
+
+### 17.7 Why no pgvector / embeddings / RAG in V1
+
+Evidence grounding (Phase D) is satisfied entirely by direct ID-array references — `ArticleSection.supporting_chunk_ids`/`supporting_topic_ids` — resolved by lookup, not by similarity search. At V1's scale (39 chunks for a 2h47m podcast, per the real validation run), an LLM reading a compact topic list or a handful of chunks per section has no retrieval problem to solve; semantic search would add infrastructure (an embedding model choice, a vector index, a retrieval step with its own failure modes) to solve a problem this pipeline doesn't have yet. Introduce `EmbeddingProvider`/pgvector when a concrete need appears against real generated articles (e.g. cross-episode Q&A, §16) — not preemptively because the original architecture sketch mentioned RAG.
+
+### 17.8 API surface additions
+
+```
+POST   /api/v1/episodes/{id}/generate-article   ✅  202, enqueues ARTICLE_GENERATION — never auto-chained
+                                                      after chunking (unlike ingestion -> processing): this
+                                                      makes paid LLM calls, so it's explicit-only.
+GET    /api/v1/episodes/{id}/article             ✅  article + sections (with resolved source chunks/timestamps)
+                                                      + latest validation result + current episode status
+```
+
+`frontend/app/dev/review/[episodeId]/page.tsx` is Phase I's minimal reviewable surface over this: the article, its sections, each section's supporting source timestamps, processing status, and validation pass/fail per check — explicitly not a styled editorial CMS (§16's "real admin dashboard" is still later).
 
 These are called out rather than pre-decided because §98 instructs explaining *why* before making an architectural change, and none of them are forced by Phase 3A.

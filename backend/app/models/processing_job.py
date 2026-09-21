@@ -24,6 +24,13 @@ class JobType(str, enum.Enum):
     # always immediately consumes cleaning's output; see
     # app/services/chunking_service.py and ARCHITECTURE.md.
     TRANSCRIPT_PROCESSING = "TRANSCRIPT_PROCESSING"
+    # The whole AI pipeline (topic analysis -> planning -> section
+    # generation -> assembly -> validation -> bounded revision) as one
+    # LangGraph-orchestrated job -- see app/ai/graph.py. Deliberately NOT
+    # auto-chained after TRANSCRIPT_PROCESSING (unlike ingestion ->
+    # processing): it makes paid LLM calls, so it's triggered explicitly
+    # via POST /episodes/{id}/generate-article.
+    ARTICLE_GENERATION = "ARTICLE_GENERATION"
 
 
 class JobStatus(str, enum.Enum):

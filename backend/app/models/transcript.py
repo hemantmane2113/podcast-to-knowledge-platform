@@ -10,6 +10,7 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 if TYPE_CHECKING:
     from app.models.chunk import Chunk
     from app.models.episode import Episode
+    from app.models.topic import Topic
     from app.models.transcript_segment import TranscriptSegment
 
 
@@ -39,4 +40,9 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="transcript",
         cascade="all, delete-orphan",
         order_by="Chunk.sequence_number",
+    )
+    topics: Mapped[list["Topic"]] = relationship(
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        order_by="Topic.sequence_number",
     )

@@ -52,6 +52,22 @@ class EpisodeAlreadyProcessingError(AppError):
     status_code = 409
 
 
+class ChunksNotFoundError(AppError):
+    """The episode has a transcript but no chunks yet -- Phase 3A
+    (cleaning + chunking) hasn't completed for it, so article generation
+    has nothing to work from."""
+
+    code = "CHUNKS_NOT_FOUND"
+    status_code = 404
+
+
+class ArticleNotFoundError(AppError):
+    """No article has been generated for this episode yet."""
+
+    code = "ARTICLE_NOT_FOUND"
+    status_code = 404
+
+
 class TranscriptProviderError(AppError):
     """The transcript provider (e.g. Supadata) failed in a way that isn't
     one of the more specific subclasses below. Used as the catch-all
@@ -88,4 +104,38 @@ class MalformedProviderResponseError(TranscriptProviderError):
     shape. Never retried — a malformed response won't fix itself, and
     silently guessing at fields risks inventing transcript content."""
 
+    retryable = False
+
+
+class LLMProviderError(AppError):
+    """An LLMProvider (Groq/OpenAI/open-source) call failed in a way that
+    isn't one of the more specific subclasses below. Mirrors
+    TranscriptProviderError's shape and defaults (see app/providers/llm/)."""
+
+    code = "LLM_PROVIDER_ERROR"
+    status_code = 502
+    retryable = True
+
+
+class LLMProviderAuthError(LLMProviderError):
+    """Invalid/missing provider API key. Never retried."""
+
+    code = "LLM_PROVIDER_AUTH_ERROR"
+    retryable = False
+
+
+class LLMProviderRateLimitError(LLMProviderError):
+    """Provider rate limit hit. Retried with backoff."""
+
+    code = "LLM_PROVIDER_RATE_LIMIT_ERROR"
+    retryable = True
+
+
+class LLMStructuredOutputError(LLMProviderError):
+    """The model's response couldn't be parsed/validated against the
+    requested structured-output schema, even after one retry. Never
+    retried further here — a third identical attempt is unlikely to
+    differ; the caller decides whether to fall back or fail the job."""
+
+    code = "LLM_STRUCTURED_OUTPUT_ERROR"
     retryable = False

@@ -7,14 +7,16 @@ from app.core.exceptions import TranscriptProviderAuthError, TranscriptProviderE
 from app.models.chunk import Chunk
 from app.models.episode import Episode, ProcessingStatus
 from app.models.processing_job import JobStatus, JobType, ProcessingJob
+from app.repositories.article_repository import ArticleRepository
 from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.episode_repository import EpisodeRepository
 from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.repositories.transcript_repository import TranscriptRepository
 from app.schemas.transcript import NormalizedSegment, NormalizedTranscript
-from app.worker.tasks import MAX_TRIES, ingest_episode_transcript, process_transcript
+from app.services.chunking_service import ChunkCandidate
+from app.worker.tasks import MAX_TRIES, generate_article, ingest_episode_transcript, process_transcript
 from tests.conftest import TEST_DATABASE_URL
-from tests.fakes import FakeJobQueue, StubProvider
+from tests.fakes import FakeJobQueue, FakeLLMProvider, StubProvider
 
 VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -243,3 +245,126 @@ async def test_process_transcript_missing_transcript_fails_without_raising(
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
     assert refreshed_episode.status == ProcessingStatus.FAILED
     assert refreshed_job.status == JobStatus.FAILED
+
+
+# --- generate_article (Phase C-H) --------------------------------------------------
+
+
+async def _seed_episode_with_chunks(session: AsyncSession):
+    episode, transcript, _ = await _seed_episode_with_transcript(session)
+    chunk_candidates = [
+        ChunkCandidate(
+            sequence_number=0,
+            # Long enough that a 150-word generated section comfortably
+            # satisfies article_max_length_ratio (default 0.4) -- a
+            # too-short transcript here would make the "good" generated
+            # section itself fail check_article_length and trigger an
+            # unplanned revision.
+            text=" ".join(["word"] * 2000),
+            start_ms=0,
+            end_ms=10_000,
+            source_segment_ids=[s.id for s in transcript.segments],
+            token_count=2000,
+        )
+    ]
+    await ChunkRepository(session).replace_all(
+        transcript_id=transcript.id, episode_id=episode.id, candidates=chunk_candidates
+    )
+    jobs = ProcessingJobRepository(session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await session.commit()
+    return episode, transcript, job
+
+
+def _fake_llm_provider() -> FakeLLMProvider:
+    from app.ai.schemas import ArticlePlanResult, GeneratedSection, PlannedSection, TopicAnalysisResult, TopicItem
+
+    return FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0])]),
+            ArticlePlanResult(
+                title="The Article",
+                introduction_summary="i",
+                sections=[PlannedSection(heading="Intro", supporting_topic_sequence_numbers=[0])],
+                conclusion_summary="c",
+            ),
+            GeneratedSection(heading="Intro", content=" ".join(["word"] * 150)),
+        ]
+    )
+
+
+async def test_generate_article_success_persists_article_and_marks_ready_for_review(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    ctx = {"job_try": 1, "llm_provider": _fake_llm_provider()}
+
+    await generate_article(ctx, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_job.status == JobStatus.COMPLETED
+
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    assert article is not None
+    assert article.title == "The Article"
+    assert len(article.sections) == 1
+
+
+async def test_generate_article_missing_llm_provider_fails_without_raising(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    ctx = {"job_try": 1, "llm_provider": None}
+
+    await generate_article(ctx, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert "not configured" in refreshed_episode.last_error
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_missing_transcript_fails_without_raising(
+    db_session: AsyncSession,
+) -> None:
+    episodes = EpisodeRepository(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    episode = episodes.create(youtube_video_id=VIDEO_ID, youtube_url=VIDEO_URL)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await db_session.commit()
+
+    await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_missing_chunks_fails_without_raising(db_session: AsyncSession) -> None:
+    episode, transcript, _ = await _seed_episode_with_transcript(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await db_session.commit()
+
+    await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_is_idempotent_on_rerun(db_session: AsyncSession) -> None:
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
+    first_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+
+    second_job = ProcessingJobRepository(db_session).create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await db_session.commit()
+    await generate_article(
+        {"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(second_job.id)
+    )
+    second_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+
+    assert second_article.id != first_article.id  # delete-then-reinsert, same as Chunk/Topic
+    assert second_article.title == first_article.title

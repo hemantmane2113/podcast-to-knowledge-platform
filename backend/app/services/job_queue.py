@@ -7,6 +7,7 @@ from app.config import get_settings
 
 _TRANSCRIPT_INGESTION_TASK = "ingest_episode_transcript"
 _TRANSCRIPT_PROCESSING_TASK = "process_transcript"
+_ARTICLE_GENERATION_TASK = "generate_article"
 
 
 class JobQueue:
@@ -25,6 +26,11 @@ class JobQueue:
         self, *, episode_id: uuid.UUID, job_id: uuid.UUID
     ) -> None:
         await self._redis.enqueue_job(_TRANSCRIPT_PROCESSING_TASK, str(episode_id), str(job_id))
+
+    async def enqueue_article_generation(
+        self, *, episode_id: uuid.UUID, job_id: uuid.UUID
+    ) -> None:
+        await self._redis.enqueue_job(_ARTICLE_GENERATION_TASK, str(episode_id), str(job_id))
 
 
 _pool: ArqRedis | None = None
