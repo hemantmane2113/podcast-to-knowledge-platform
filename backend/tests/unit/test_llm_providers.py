@@ -11,14 +11,23 @@ shared logic directly rather than duplicating it per concrete provider.
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+import groq
+import httpx
+import openai
 import pytest
 from pydantic import BaseModel
 
 from app.config.settings import Settings
-from app.core.exceptions import LLMProviderAuthError, LLMStructuredOutputError
+from app.core.exceptions import (
+    LLMProviderAuthError,
+    LLMProviderError,
+    LLMProviderRateLimitError,
+    LLMStructuredOutputError,
+)
 from app.providers.llm._chat_completions import ChatCompletionsProvider
+from app.providers.llm.base import LLMMessage
 from app.providers.llm.factory import get_llm_provider
 from app.providers.llm.groq_provider import GroqProvider
 from app.providers.llm.openai_provider import OpenAIProvider
@@ -230,3 +239,111 @@ async def test_generate_structured_includes_json_schema_in_system_prompt() -> No
     assert "Be helpful." in sent_messages[0]["content"]
     assert "\"title\"" in sent_messages[0]["content"]  # schema property present
     assert create.call_args_list[0].kwargs["response_format"] == {"type": "json_object"}
+
+
+# --- concrete providers: client construction, end-to-end generate(), and -----------
+# --- each provider's own _map_exception against REAL SDK exception classes ---------
+# (the shared-base tests above only prove ChatCompletionsProvider itself is correct;
+# these prove GroqProvider/OpenAIProvider/OpenSourceProvider wire it up correctly).
+
+
+def _httpx_response(status_code: int) -> httpx.Response:
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    return httpx.Response(status_code=status_code, request=request)
+
+
+def _httpx_request() -> httpx.Request:
+    return httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+
+
+async def test_groq_provider_generate_end_to_end_through_real_client_construction() -> None:
+    with patch("app.providers.llm.groq_provider.AsyncGroq") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from groq"))
+
+        provider = GroqProvider(api_key="real-key", model="llama-3.3-70b-versatile")
+        mock_client_cls.assert_called_once_with(api_key="real-key")
+
+        response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
+
+    assert response.text == "hello from groq"
+    assert response.model == "llama-3.3-70b-versatile"
+    mock_client.chat.completions.create.assert_awaited_once()
+    assert mock_client.chat.completions.create.call_args.kwargs["model"] == "llama-3.3-70b-versatile"
+
+
+def test_groq_provider_maps_authentication_error() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    exc = groq.AuthenticationError("bad key", response=_httpx_response(401), body=None)
+    assert isinstance(provider._map_exception(exc), LLMProviderAuthError)
+
+
+def test_groq_provider_maps_rate_limit_error() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    exc = groq.RateLimitError("slow down", response=_httpx_response(429), body=None)
+    assert isinstance(provider._map_exception(exc), LLMProviderRateLimitError)
+
+
+def test_groq_provider_maps_connection_error_to_retryable_generic() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    exc = groq.APIConnectionError(request=_httpx_request())
+    mapped = provider._map_exception(exc)
+    assert type(mapped) is LLMProviderError
+    assert mapped.retryable is True
+
+
+def test_groq_provider_maps_unknown_exception_to_generic_provider_error() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    mapped = provider._map_exception(ValueError("something else"))
+    assert type(mapped) is LLMProviderError
+
+
+async def test_openai_provider_generate_end_to_end_through_real_client_construction() -> None:
+    with patch("app.providers.llm.openai_provider.AsyncOpenAI") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from openai"))
+
+        provider = OpenAIProvider(api_key="real-key", model="gpt-4o-mini")
+        mock_client_cls.assert_called_once_with(api_key="real-key")
+
+        response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
+
+    assert response.text == "hello from openai"
+    mock_client.chat.completions.create.assert_awaited_once()
+
+
+def test_openai_provider_maps_authentication_error() -> None:
+    provider = OpenAIProvider(api_key="k", model="m")
+    exc = openai.AuthenticationError("bad key", response=_httpx_response(401), body=None)
+    assert isinstance(provider._map_exception(exc), LLMProviderAuthError)
+
+
+def test_openai_provider_maps_rate_limit_error() -> None:
+    provider = OpenAIProvider(api_key="k", model="m")
+    exc = openai.RateLimitError("slow down", response=_httpx_response(429), body=None)
+    assert isinstance(provider._map_exception(exc), LLMProviderRateLimitError)
+
+
+async def test_opensource_provider_generate_end_to_end_uses_configured_base_url() -> None:
+    with patch("app.providers.llm.opensource_provider.AsyncOpenAI") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from vllm"))
+
+        provider = OpenSourceProvider(base_url="http://localhost:8080/v1", model="local-model")
+        mock_client_cls.assert_called_once_with(base_url="http://localhost:8080/v1", api_key="not-required")
+
+        response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
+
+    assert response.text == "hello from vllm"
+
+
+def test_opensource_provider_passes_through_a_real_api_key_when_given() -> None:
+    with patch("app.providers.llm.opensource_provider.AsyncOpenAI") as mock_client_cls:
+        OpenSourceProvider(base_url="http://localhost:8080/v1", model="m", api_key="secret")
+        mock_client_cls.assert_called_once_with(base_url="http://localhost:8080/v1", api_key="secret")
+
+
+def test_opensource_provider_maps_authentication_error() -> None:
+    provider = OpenSourceProvider(base_url="http://localhost:8080/v1", model="m")
+    exc = openai.AuthenticationError("bad key", response=_httpx_response(401), body=None)
+    assert isinstance(provider._map_exception(exc), LLMProviderAuthError)
