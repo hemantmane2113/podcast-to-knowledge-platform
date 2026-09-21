@@ -5,8 +5,7 @@ import logging
 from arq.connections import RedisSettings
 
 from app.config import get_settings
-from app.core.exceptions import LLMProviderAuthError, TranscriptProviderAuthError
-from app.providers.llm.factory import get_llm_provider
+from app.core.exceptions import TranscriptProviderAuthError
 from app.providers.transcript.supadata import SupadataTranscriptProvider
 from app.services.job_queue import JobQueue
 from app.worker.tasks import MAX_TRIES, generate_article, ingest_episode_transcript, process_transcript
@@ -27,21 +26,16 @@ async def startup(ctx: dict) -> None:
         )
         ctx["provider"] = None
 
-    try:
-        ctx["llm_provider"] = get_llm_provider(settings)
-    except (LLMProviderAuthError, ValueError) as exc:
-        # Same "start anyway, fail each job clearly" pattern as the
-        # transcript provider above -- article generation is an explicit,
-        # opt-in job (never auto-chained), so a missing key (or an unknown
-        # LLM_PROVIDER value, which only Settings' own validator rejects
-        # outside development) shouldn't block ingestion/processing from
-        # working.
-        logger.warning(
-            "LLM provider (%s) is not configured: %s. Article generation jobs will fail until it is set.",
-            settings.llm_provider,
-            exc,
-        )
-        ctx["llm_provider"] = None
+    # Deliberately NOT constructing an LLM provider here, even with the
+    # same graceful-degradation pattern as the transcript provider above:
+    # ingestion and chunking (the jobs every worker process handles most
+    # of the time) never use one, so this process shouldn't construct --
+    # or even import the groq/openai SDKs to construct -- one it may never
+    # need. generate_article (app/worker/tasks.py) is the only job type
+    # that needs an LLM provider, and it builds one itself, lazily, via
+    # app.providers.llm.factory.get_llm_provider, exactly when that job
+    # runs (same "fail clearly at the point of use" outcome as before,
+    # just moved to where the use actually is).
 
     # ctx["redis"] is populated by arq itself before on_startup runs --
     # reuse that connection rather than opening a second pool just to

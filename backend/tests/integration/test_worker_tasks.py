@@ -247,6 +247,43 @@ async def test_process_transcript_missing_transcript_fails_without_raising(
     assert refreshed_job.status == JobStatus.FAILED
 
 
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError("get_llm_provider must not be called for this job")
+
+
+async def test_ingest_episode_transcript_never_calls_get_llm_provider(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the lazy-LLM-provider fix: ingestion must not
+    construct (or attempt to construct) an LLM provider, regardless of
+    whether one is configured."""
+    monkeypatch.setattr("app.providers.llm.factory.get_llm_provider", _fail_if_called)
+    episode, job = await _seed_episode_and_job(db_session)
+    transcript = NormalizedTranscript(
+        language="en", segments=[NormalizedSegment(text="hi", start_ms=0, duration_ms=500)]
+    )
+    ctx = {"job_try": 1, "provider": StubProvider(transcript=transcript), "job_queue": FakeJobQueue()}
+
+    await ingest_episode_transcript(ctx, str(episode.id), str(job.id))  # must not raise
+
+    refreshed_episode, _ = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
+
+
+async def test_process_transcript_never_calls_get_llm_provider(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the lazy-LLM-provider fix: chunking must not
+    construct (or attempt to construct) an LLM provider."""
+    monkeypatch.setattr("app.providers.llm.factory.get_llm_provider", _fail_if_called)
+    episode, transcript, job = await _seed_episode_with_transcript(db_session)
+
+    await process_transcript({"job_try": 1}, str(episode.id), str(job.id))  # must not raise
+
+    refreshed_episode, _ = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.CHUNKING
+
+
 # --- generate_article (Phase C-H) --------------------------------------------------
 
 
@@ -351,6 +388,55 @@ async def test_generate_article_missing_chunks_fails_without_raising(db_session:
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
     assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_lazily_constructs_the_provider_when_ctx_has_no_override(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the lazy-LLM-provider fix: with no
+    ctx["llm_provider"] override -- matching the real worker ctx, since
+    app.worker.settings.startup() no longer sets one -- generate_article
+    must call app.providers.llm.factory.get_llm_provider itself, exactly
+    when this job runs."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    calls: list = []
+
+    def _fake_get_llm_provider(settings):
+        calls.append(settings)
+        return _fake_llm_provider()
+
+    monkeypatch.setattr("app.providers.llm.factory.get_llm_provider", _fake_get_llm_provider)
+
+    await generate_article({"job_try": 1}, str(episode.id), str(job.id))  # no "llm_provider" key
+
+    assert len(calls) == 1
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_job.status == JobStatus.COMPLETED
+
+
+async def test_generate_article_fails_clearly_when_lazy_construction_raises(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the original incident: a real, misconfigured
+    provider (missing GROQ_API_KEY/LLM_MODEL) must still fail the job
+    clearly rather than raise -- now via the lazy construction path
+    instead of ctx injection."""
+    from app.core.exceptions import LLMProviderAuthError
+
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+
+    def _raise(settings):
+        raise LLMProviderAuthError("LLM_MODEL is not configured")
+
+    monkeypatch.setattr("app.providers.llm.factory.get_llm_provider", _raise)
+
+    await generate_article({"job_try": 1}, str(episode.id), str(job.id))  # no "llm_provider" key
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert "not configured" in refreshed_episode.last_error
     assert refreshed_job.status == JobStatus.FAILED
 
 

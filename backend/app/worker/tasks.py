@@ -14,7 +14,7 @@ from app.ai.graph import run_article_pipeline
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config import get_settings
 from app.core.db import get_sessionmaker
-from app.core.exceptions import ChunksNotFoundError, TranscriptNotFoundError
+from app.core.exceptions import ChunksNotFoundError, LLMProviderAuthError, TranscriptNotFoundError
 from app.models.episode import ProcessingStatus
 from app.models.processing_job import JobType
 from app.repositories.chunk_repository import ChunkRepository
@@ -182,14 +182,40 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
     ingestion -> processing): this makes paid LLM calls, so it's only
     ever enqueued by an explicit POST /episodes/{id}/generate-article
     (see app/api/v1/articles.py).
+
+    Unlike the transcript provider (constructed once per worker process
+    in app/worker/settings.py::startup), the LLM provider is constructed
+    here, lazily, on each invocation -- this is the only job type that
+    needs one, so worker startup and ingestion/chunking never construct,
+    import, or depend on it. `ctx["llm_provider"]` is honored first when
+    present, purely as a test-injection seam (see tests/fakes.py's
+    FakeLLMProvider) -- the real worker ctx never sets it.
     """
     episode_uuid = uuid.UUID(episode_id)
     job_uuid = uuid.UUID(job_id)
 
-    llm_provider = ctx.get("llm_provider")
+    settings = get_settings()
     session_factory = get_sessionmaker()
 
     async with session_factory() as session:
+        if "llm_provider" in ctx:
+            llm_provider = ctx["llm_provider"]
+        else:
+            # Local import: only this code path needs the groq/openai
+            # SDKs importable. A module-level import here (as it used to
+            # be in app/worker/settings.py) would require them just to
+            # start the worker process or run an ingestion/chunking job,
+            # which is the exact incident this task fixes.
+            from app.providers.llm.factory import get_llm_provider
+
+            try:
+                llm_provider = get_llm_provider(settings)
+            except (LLMProviderAuthError, ValueError) as exc:
+                logger.warning(
+                    "LLM provider (%s) is not configured: %s", settings.llm_provider, exc
+                )
+                llm_provider = None
+
         if llm_provider is None:
             await _mark_failed(
                 session,
@@ -204,8 +230,6 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
         if job is not None:
             jobs.mark_running(job)
             await session.commit()
-
-        settings = get_settings()
 
         try:
             transcripts = TranscriptRepository(session)
