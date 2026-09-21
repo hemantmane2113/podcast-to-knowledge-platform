@@ -2,6 +2,34 @@ import pytest
 
 from app.config.settings import Settings
 
+# Settings(_env_file=None, ...) only disables .env loading -- it does NOT
+# stop pydantic-settings from reading a real value already present in the
+# OS/process environment for any field a test doesn't pass explicitly as a
+# constructor kwarg (init kwargs are pydantic-settings' highest-priority
+# source, env vars are next). Every test below constructs Settings with
+# only a handful of explicit kwargs, so without this fixture, a real
+# SUPADATA_API_KEY/GROQ_API_KEY/etc. already exported in the shell running
+# pytest would silently change these tests' outcomes -- found via a real
+# failure on a machine with a real SUPADATA_API_KEY in its process
+# environment (test_development_boots_without_secrets expected it empty;
+# test_non_development_requires_secrets expected the validator to raise
+# because it was missing).
+_ENV_VARS_TO_ISOLATE = (
+    "APP_ENV",
+    "SUPADATA_API_KEY",
+    "GROQ_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENSOURCE_API_KEY",
+    "ADMIN_AUTH_SECRET",
+    "LLM_PROVIDER",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_process_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _ENV_VARS_TO_ISOLATE:
+        monkeypatch.delenv(name, raising=False)
+
 
 def test_development_boots_without_secrets() -> None:
     settings = Settings(_env_file=None, app_env="development")
