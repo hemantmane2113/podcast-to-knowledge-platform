@@ -91,8 +91,8 @@ The full target layout, with backend module responsibilities for later phases an
 - [x] LangGraph used only for this AI workflow (`app/ai/graph.py`) — ingestion/processing/review stay plain services, no checkpointer (Postgres is the durability layer, same as every other job)
 
 **Both together:**
-- [x] 204 backend tests (1 real-LLM smoke test skipped by default, run explicitly — see below) — unit, integration against real Postgres, mocked Supadata/LLM providers, live ASGI API tests
-- [x] `scripts/inspect_chunks.py`, `scripts/inspect_article.py`, `scripts/validate_real_transcript.py` dev tools
+- [x] 243 backend tests (1 real-LLM smoke test skipped by default, run explicitly — see below) — unit, integration against real Postgres, mocked Supadata/LLM providers, live ASGI API tests
+- [x] `scripts/inspect_chunks.py`, `scripts/inspect_article.py`, `scripts/validate_real_transcript.py` dev tools, plus `scripts/run_real_article_pipeline.py` to drive the full pipeline against a real running stack — see "Real-data validation" below
 - [ ] pgvector/embeddings — deliberately not introduced; 39 chunks with direct ID-array grounding doesn't need vector retrieval yet (see `ARCHITECTURE.md`)
 - [ ] Real end-to-end run against a real LLM + real Supadata data from a network-unrestricted environment — next step, see "Real-data validation" below
 - [ ] Public reading experience and the real admin/editorial dashboard — later phase
@@ -133,6 +133,37 @@ RUN_REAL_LLM_SMOKE_TEST=1 LLM_PROVIDER=groq GROQ_API_KEY=... LLM_MODEL=... \
 cd frontend
 npm install
 npm run dev
+```
+
+## Real-data validation
+
+`scripts/run_real_article_pipeline.py` drives the full V1 pipeline (ingestion →
+cleaning → chunking → topic analysis → planning → section generation →
+validation → bounded revision) against a **real running backend** over its
+actual HTTP API. It is an HTTP client, not a second implementation of the
+pipeline — every stage still runs through `app/ai/graph.py`, the worker task,
+and the real repositories, exactly as for any other caller (see
+`ARCHITECTURE.md` §17.5 for why a DB-free reimplementation would be wrong:
+Topic/ArticlePlan/Article persistence is core to this design, not incidental).
+
+Requires the real stack already running (`docker compose up`, or the native
+equivalent above) with real `SUPADATA_API_KEY`/`GROQ_API_KEY` configured
+server-side in `.env`. The script itself never reads or prints those keys —
+it only talks to the API over HTTP.
+
+It stops **before** the paid article-generation step by default, once
+ingestion, cleaning, and chunking finish, and prints the exact follow-up
+command:
+
+```bash
+cd backend
+# Step 1: ingest + wait for chunking. No LLM cost. Review the output.
+python -m scripts.run_real_article_pipeline "https://www.youtube.com/watch?v=Y566_T-YlNQ"
+
+# Step 2, only after reviewing step 1: actually generate the article
+# (this makes real, paid calls to your configured LLM provider).
+python -m scripts.run_real_article_pipeline "https://www.youtube.com/watch?v=Y566_T-YlNQ" \
+    --episode-id <uuid-from-step-1> --generate-article
 ```
 
 ## Configuration
