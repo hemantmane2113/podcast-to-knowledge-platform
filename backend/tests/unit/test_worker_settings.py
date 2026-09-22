@@ -12,9 +12,29 @@ LLM_PROVIDER/GROQ_API_KEY/LLM_MODEL happen to be set in the environment
 running these tests.
 """
 
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
 import app.worker.settings as worker_settings
 import app.worker.tasks as worker_tasks
-from app.worker.settings import JOB_TIMEOUT_SECONDS, WorkerSettings, startup
+from app.models.episode import ProcessingStatus
+from app.models.processing_job import JobStatus, JobType
+from app.repositories.episode_repository import EpisodeRepository
+from app.repositories.processing_job_repository import ProcessingJobRepository
+from app.worker.settings import (
+    JOB_TIMEOUT_SECONDS,
+    STALE_JOB_GRACE_SECONDS,
+    WorkerSettings,
+    _recover_stale_article_generation_jobs,
+    startup,
+)
+
+VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+VIDEO_ID = "dQw4w9WgXcQ"
+
+_STALE_MARGIN = timedelta(seconds=JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS + 30)
+_FRESH_MARGIN = timedelta(seconds=10)
 
 
 async def test_startup_does_not_populate_llm_provider_in_ctx() -> None:
@@ -58,3 +78,147 @@ def test_worker_settings_explicitly_configures_a_1200_second_job_timeout() -> No
     in version control, rather than left at arq's implicit default."""
     assert JOB_TIMEOUT_SECONDS == 1200
     assert WorkerSettings.job_timeout == 1200
+
+
+async def _seed_episode(session: AsyncSession):
+    episodes = EpisodeRepository(session)
+    episode = episodes.create(youtube_video_id=VIDEO_ID, youtube_url=VIDEO_URL)
+    episodes.set_status(episode, ProcessingStatus.ANALYZING)
+    await session.commit()
+    return episode
+
+
+async def test_recover_marks_stale_running_article_generation_job_failed(
+    db_session: AsyncSession,
+) -> None:
+    """Reproduces the real production incident this fix targets: a worker
+    process killed/restarted mid-job leaves the row exactly as it last
+    committed (RUNNING, no exception ever raised -- unlike arq's own
+    in-loop job_timeout cancellation, which app/worker/tasks.py's
+    `except asyncio.CancelledError` already handles). A RUNNING row whose
+    started_at is older than JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS
+    cannot possibly still be legitimately in progress."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _STALE_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see below
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+    assert refreshed_job.error_message
+
+
+async def test_recover_leaves_recent_running_article_generation_job_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """Proves this is NOT a blind "mark every RUNNING job failed" sweep
+    (an explicit requirement): a job that started well within
+    JOB_TIMEOUT_SECONDS could still be a live, legitimately in-progress
+    job on a healthy worker, and must be left alone."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _FRESH_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_recover_marks_stale_pending_article_generation_job_failed(
+    db_session: AsyncSession,
+) -> None:
+    """A worker can also die between enqueue and its first mark_running
+    (job_try/mark_running happens at the top of generate_article) -- the
+    row is left PENDING forever in that case, never RUNNING. Same
+    staleness argument applies to created_at instead of started_at."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.created_at = datetime.now(UTC) - _STALE_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_recover_leaves_completed_article_generation_job_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """A historical COMPLETED job with an old started_at must never be
+    touched -- staleness only applies to still-active (RUNNING/PENDING)
+    statuses."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.COMPLETED
+    job.started_at = datetime.now(UTC) - _STALE_MARGIN
+    job.completed_at = datetime.now(UTC) - _STALE_MARGIN
+    await db_session.commit()
+    job_id = job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_job.status == JobStatus.COMPLETED
+
+
+async def test_recover_ignores_stale_running_jobs_of_other_job_types(
+    db_session: AsyncSession,
+) -> None:
+    """Scoped to ARTICLE_GENERATION only (the smallest safe V1 fix for the
+    reported incident) -- a stale TRANSCRIPT_PROCESSING row is left for a
+    future, separately-scoped fix rather than silently swept up here."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.TRANSCRIPT_PROCESSING)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _STALE_MARGIN
+    await db_session.commit()
+    job_id = job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_startup_calls_stale_job_recovery(db_session: AsyncSession) -> None:
+    """End-to-end through the real on_startup entrypoint arq calls, not
+    just the helper directly -- proves the wiring in startup() is live."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _STALE_MARGIN
+    await db_session.commit()
+    job_id = job.id  # captured before expire_all below
+
+    await startup({"redis": object()})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_job.status == JobStatus.FAILED

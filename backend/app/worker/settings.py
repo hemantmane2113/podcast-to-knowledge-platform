@@ -1,14 +1,24 @@
 """arq WorkerSettings — run with: arq app.worker.settings.WorkerSettings"""
 
 import logging
+from datetime import UTC, datetime, timedelta
 
 from arq.connections import RedisSettings
 
 from app.config import get_settings
+from app.core.db import get_sessionmaker
 from app.core.exceptions import TranscriptProviderAuthError
+from app.models.processing_job import JobType
 from app.providers.transcript.supadata import SupadataTranscriptProvider
+from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.services.job_queue import JobQueue
-from app.worker.tasks import MAX_TRIES, generate_article, ingest_episode_transcript, process_transcript
+from app.worker.tasks import (
+    MAX_TRIES,
+    _mark_failed,
+    generate_article,
+    ingest_episode_transcript,
+    process_transcript,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +34,64 @@ logger = logging.getLogger(__name__)
 # stuck (app/worker/tasks.py::generate_article's
 # `except asyncio.CancelledError` handling, unchanged here).
 JOB_TIMEOUT_SECONDS = 1200
+
+# A worker *process* being killed/restarted (container redeploy, OOM kill,
+# `docker restart`) leaves a RUNNING/PENDING processing_jobs row exactly as
+# it last committed -- unlike arq's own in-loop job_timeout cancellation
+# (JOB_TIMEOUT_SECONDS above), no exception is ever raised in that case, so
+# app/worker/tasks.py::generate_article's `except asyncio.CancelledError`
+# handling (commit 73b6191) never runs, and nothing else in arq itself
+# recovers it (its Redis in_progress_key is a concurrency lock, not a
+# recovery mechanism -- it just silently expires). Found via a real
+# production row stuck at RUNNING/ANALYZING after a worker restart, with
+# updated_at showing it was last touched well past JOB_TIMEOUT_SECONDS ago.
+#
+# This grace period is added on top of JOB_TIMEOUT_SECONDS before a RUNNING
+# job is considered stale: any live worker still legitimately executing a
+# job would have had arq cancel it (and cleanly mark it FAILED) at
+# JOB_TIMEOUT_SECONDS already, so a RUNNING row older than
+# JOB_TIMEOUT_SECONDS + this grace cannot possibly still be in progress --
+# this is a bound on elapsed time, not a blind "mark everything RUNNING as
+# failed" sweep. The grace itself only absorbs clock skew / startup-order
+# noise between the row's started_at and this check.
+STALE_JOB_GRACE_SECONDS = 60
+
+
+async def _recover_stale_article_generation_jobs(ctx: dict) -> None:
+    """Runs once per worker process, at startup. Finds ARTICLE_GENERATION
+    jobs that cannot possibly still be legitimately in progress -- RUNNING
+    since before JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS ago, or
+    PENDING for that long without ever having been picked up (e.g. a worker
+    died between enqueue and its first mark_running) -- and marks them
+    FAILED via the same `_mark_failed` helper every other failure path in
+    app/worker/tasks.py uses, so the episode is unstuck from ANALYZING and
+    a user can retry generation instead of the job being wedged forever.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS)
+    session_factory = get_sessionmaker()
+
+    async with session_factory() as session:
+        jobs = ProcessingJobRepository(session)
+        stale_jobs = await jobs.get_stale_active_jobs(
+            JobType.ARTICLE_GENERATION, running_cutoff=cutoff, pending_cutoff=cutoff
+        )
+        for job in stale_jobs:
+            logger.error(
+                "Recovering stale ARTICLE_GENERATION job %s for episode %s (was %s, "
+                "started_at=%s, created_at=%s) -- worker process was likely killed or "
+                "restarted before the job reached a terminal status.",
+                job.id,
+                job.episode_id,
+                job.status,
+                job.started_at,
+                job.created_at,
+            )
+            await _mark_failed(
+                session,
+                job.episode_id,
+                job.id,
+                "Article generation was interrupted by a worker restart. Please retry.",
+            )
 
 
 async def startup(ctx: dict) -> None:
@@ -54,6 +122,11 @@ async def startup(ctx: dict) -> None:
     # reuse that connection rather than opening a second pool just to
     # enqueue the follow-up transcript-processing job.
     ctx["job_queue"] = JobQueue(ctx["redis"])
+
+    # See STALE_JOB_GRACE_SECONDS above: recovers ARTICLE_GENERATION jobs
+    # left stuck RUNNING/PENDING by a worker process that was killed or
+    # restarted, not just arq's own in-loop timeout cancellation.
+    await _recover_stale_article_generation_jobs(ctx)
 
 
 async def shutdown(ctx: dict) -> None:

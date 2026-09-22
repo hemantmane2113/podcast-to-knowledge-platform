@@ -1,7 +1,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.processing_job import JobStatus, JobType, ProcessingJob
@@ -36,6 +36,26 @@ class ProcessingJobRepository:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def get_stale_active_jobs(
+        self, job_type: JobType, *, running_cutoff: datetime, pending_cutoff: datetime
+    ) -> list[ProcessingJob]:
+        """RUNNING jobs whose started_at predates `running_cutoff`, or
+        PENDING jobs whose created_at predates `pending_cutoff` -- jobs
+        that cannot possibly still be legitimately in progress (their
+        worker process was killed/restarted before ever reaching a
+        terminal status; see app/worker/settings.py's stale-job
+        reconciliation, which calls this on worker startup)."""
+        result = await self._session.execute(
+            select(ProcessingJob).where(
+                ProcessingJob.job_type == job_type,
+                or_(
+                    and_(ProcessingJob.status == JobStatus.RUNNING, ProcessingJob.started_at < running_cutoff),
+                    and_(ProcessingJob.status == JobStatus.PENDING, ProcessingJob.created_at < pending_cutoff),
+                ),
+            )
+        )
+        return list(result.scalars().all())
 
     async def get_latest_job(
         self, episode_id: uuid.UUID, job_type: JobType
