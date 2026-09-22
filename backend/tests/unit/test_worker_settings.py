@@ -24,17 +24,37 @@ from app.repositories.episode_repository import EpisodeRepository
 from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.worker.settings import (
     JOB_TIMEOUT_SECONDS,
+    MAX_LEGITIMATE_RETRY_SEQUENCE_SECONDS,
+    STALE_JOB_CUTOFF_SECONDS,
     STALE_JOB_GRACE_SECONDS,
     WorkerSettings,
     _recover_stale_article_generation_jobs,
     startup,
 )
+from app.worker.tasks import MAX_TRIES, RETRY_DEFER_SECONDS
 
 VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 VIDEO_ID = "dQw4w9WgXcQ"
 
-_STALE_MARGIN = timedelta(seconds=JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS + 30)
+# Genuinely stale: past the full cutoff (the widest legitimate MAX_TRIES-
+# attempt sequence, including retry waits, plus grace).
+_STALE_MARGIN = timedelta(seconds=STALE_JOB_CUTOFF_SECONDS + 30)
 _FRESH_MARGIN = timedelta(seconds=10)
+
+# Older than a single JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS (the OLD,
+# pre-widening cutoff -- would have been wrongly recovered under that
+# formula) but still comfortably inside the real, multi-attempt-aware
+# cutoff: a job legitimately in the middle of its 2nd or 3rd retry attempt.
+_LEGITIMATE_MULTI_ATTEMPT_MARGIN = timedelta(seconds=STALE_JOB_CUTOFF_SECONDS - 60)
+
+# Boundary margins, offset a few seconds either side of the exact cutoff to
+# stay robust against the small real-world gap between when a test sets
+# started_at and when _recover_stale_article_generation_jobs computes
+# datetime.now(UTC) -- both are well clear of that gap while still each
+# being on a single, unambiguous side of the strict `<` comparison in
+# ProcessingJobRepository.get_stale_active_jobs.
+_JUST_INSIDE_CUTOFF_MARGIN = timedelta(seconds=STALE_JOB_CUTOFF_SECONDS - 5)
+_JUST_OUTSIDE_CUTOFF_MARGIN = timedelta(seconds=STALE_JOB_CUTOFF_SECONDS + 5)
 
 
 async def test_startup_does_not_populate_llm_provider_in_ctx() -> None:
@@ -96,8 +116,9 @@ async def test_recover_marks_stale_running_article_generation_job_failed(
     committed (RUNNING, no exception ever raised -- unlike arq's own
     in-loop job_timeout cancellation, which app/worker/tasks.py's
     `except asyncio.CancelledError` already handles). A RUNNING row whose
-    started_at is older than JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS
-    cannot possibly still be legitimately in progress."""
+    started_at is older than STALE_JOB_CUTOFF_SECONDS (the full legitimate
+    multi-attempt sequence plus grace) cannot possibly still be
+    legitimately in progress."""
     episode = await _seed_episode(db_session)
     jobs = ProcessingJobRepository(db_session)
     job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
@@ -138,6 +159,102 @@ async def test_recover_leaves_recent_running_article_generation_job_untouched(
     refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
     assert refreshed_episode.status == ProcessingStatus.ANALYZING
     assert refreshed_job.status == JobStatus.RUNNING
+
+
+def test_stale_cutoff_accounts_for_the_full_legitimate_retry_sequence() -> None:
+    """Regression test for the D.4a decision: the cutoff must be computed
+    from MAX_TRIES/JOB_TIMEOUT_SECONDS/RETRY_DEFER_SECONDS, not a hardcoded
+    number, so it stays correct if any of those change. MAX_TRIES attempts,
+    each individually bounded by JOB_TIMEOUT_SECONDS, with a
+    RETRY_DEFER_SECONDS wait between each pair of attempts (MAX_TRIES - 1
+    gaps -- no wait follows the final, non-retried attempt)."""
+    expected_sequence = (MAX_TRIES * JOB_TIMEOUT_SECONDS) + ((MAX_TRIES - 1) * RETRY_DEFER_SECONDS)
+    assert MAX_LEGITIMATE_RETRY_SEQUENCE_SECONDS == expected_sequence
+    assert STALE_JOB_CUTOFF_SECONDS == expected_sequence + STALE_JOB_GRACE_SECONDS
+    # With the current real values (MAX_TRIES=3, JOB_TIMEOUT_SECONDS=1200,
+    # RETRY_DEFER_SECONDS=30, STALE_JOB_GRACE_SECONDS=60): 3*1200 + 2*30 +
+    # 60 = 3720s (62 minutes) -- much wider than the old single-attempt
+    # cutoff of JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS = 1260s.
+    assert STALE_JOB_CUTOFF_SECONDS == 3720
+    assert STALE_JOB_CUTOFF_SECONDS > JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS
+
+
+async def test_recover_leaves_job_within_legitimate_multi_attempt_window_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """The core regression this widening exists for: once app/worker/tasks.py
+    genuinely retries via arq.Retry(defer=RETRY_DEFER_SECONDS), started_at
+    is preserved across attempts (ProcessingJobRepository.mark_running), so
+    a job legitimately in the middle of its 2nd or 3rd attempt can have a
+    started_at older than a single JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS
+    while still being completely legitimate. Recovering it anyway (the OLD
+    cutoff formula) would incorrectly kill a job arq is still working
+    through and free the episode for a wrongly-duplicated new submission."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _LEGITIMATE_MULTI_ATTEMPT_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    # Sanity-check the premise: this margin is older than the OLD,
+    # pre-widening cutoff formula would have tolerated.
+    assert _LEGITIMATE_MULTI_ATTEMPT_MARGIN > timedelta(
+        seconds=JOB_TIMEOUT_SECONDS + STALE_JOB_GRACE_SECONDS
+    )
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_recover_leaves_job_just_inside_the_cutoff_untouched(
+    db_session: AsyncSession,
+) -> None:
+    """Boundary condition: a RUNNING row just younger than
+    STALE_JOB_CUTOFF_SECONDS must not be recovered."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _JUST_INSIDE_CUTOFF_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_recover_marks_job_just_outside_the_cutoff_failed(
+    db_session: AsyncSession,
+) -> None:
+    """Boundary condition: a RUNNING row just older than
+    STALE_JOB_CUTOFF_SECONDS must be recovered."""
+    episode = await _seed_episode(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC) - _JUST_OUTSIDE_CUTOFF_MARGIN
+    await db_session.commit()
+    episode_id, job_id = episode.id, job.id  # captured before expire_all below
+
+    await _recover_stale_article_generation_jobs({})
+
+    db_session.expire_all()  # written through a separate session -- see above
+    refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
+    refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
 
 
 async def test_recover_marks_stale_pending_article_generation_job_failed(

@@ -11,6 +11,8 @@ import asyncio
 import logging
 import uuid
 
+from arq import Retry
+
 from app.ai.graph import run_article_pipeline
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config import get_settings
@@ -29,6 +31,20 @@ from app.services.transcript_processing_service import TranscriptProcessingServi
 logger = logging.getLogger(__name__)
 
 MAX_TRIES = 3
+
+# How long arq waits before re-running a job after a retryable failure.
+# Verified directly against the installed arq version (0.28.0) with a real
+# arq.worker.Worker against a real Redis (not assumed from arq's docs or
+# our own comments): raising `arq.Retry(defer=N)` is the ONLY exception
+# type arq's Worker.run_job treats as "please re-run this exact job_id" --
+# a bare re-raise of an ordinary exception (which is what this module used
+# to do) is indistinguishable, to arq, from any other unhandled exception:
+# it's treated as a terminal failure (jobs_failed += 1) and the job_id's
+# Redis bookkeeping is deleted outright, so nothing ever invokes it again.
+# `job_try` (ctx["job_try"]) only increments across genuine Retry-triggered
+# re-invocations -- it does NOT increment merely because a task raised.
+RETRY_DEFER_SECONDS = 30
+
 _GENERIC_FAILURE_MESSAGE = "Transcript ingestion failed. See server logs for details."
 _GENERIC_PROCESSING_FAILURE_MESSAGE = "Transcript processing failed. See server logs for details."
 _GENERIC_ARTICLE_FAILURE_MESSAGE = "Article generation failed. See server logs for details."
@@ -65,6 +81,23 @@ async def ingest_episode_transcript(ctx: dict, episode_id: str, job_id: str) -> 
         service = IngestionService(session, provider)
         try:
             await service.run(episode_uuid, job_uuid)
+        except asyncio.CancelledError:
+            # See generate_article's identical handler below for the full
+            # rationale -- arq's own job_timeout cancellation (and a
+            # worker-shutdown cancellation arq is about to retry) both
+            # deliver CancelledError to this task the same way; this task
+            # has no way to distinguish them, so it always marks this
+            # attempt FAILED. If arq does retry it, the next invocation's
+            # mark_running() (via IngestionService/its job repository)
+            # simply overwrites this with RUNNING again.
+            await session.rollback()
+            logger.error(
+                "Ingestion cancelled (job timeout) for episode %s (job try %s)",
+                episode_id,
+                ctx.get("job_try"),
+            )
+            await _mark_failed(session, episode_uuid, job_uuid, _GENERIC_FAILURE_MESSAGE)
+            raise
         except Exception as exc:
             await session.rollback()
 
@@ -78,7 +111,7 @@ async def ingest_episode_transcript(ctx: dict, episode_id: str, job_id: str) -> 
                     episode_id,
                     _safe_message(exc),
                 )
-                raise  # arq retries the task
+                raise Retry(defer=RETRY_DEFER_SECONDS) from exc
 
             logger.error(
                 "Ingestion failed permanently for episode %s after %s attempt(s): %s",
@@ -139,6 +172,21 @@ async def process_transcript(ctx: dict, episode_id: str, job_id: str) -> None:
         service = TranscriptProcessingService(session, config)
         try:
             chunk_count = await service.run(episode_uuid)
+        except asyncio.CancelledError:
+            # See generate_article's identical handler below for the full
+            # rationale. mark_running() already ran above, so this task
+            # (unlike ingestion) doesn't depend on the service to have set
+            # RUNNING before this can meaningfully transition to FAILED.
+            await session.rollback()
+            logger.error(
+                "Processing cancelled (job timeout) for episode %s (job try %s)",
+                episode_id,
+                ctx.get("job_try"),
+            )
+            await _mark_failed(
+                session, episode_uuid, job_uuid, _GENERIC_PROCESSING_FAILURE_MESSAGE
+            )
+            raise
         except Exception as exc:
             await session.rollback()
 
@@ -152,7 +200,7 @@ async def process_transcript(ctx: dict, episode_id: str, job_id: str) -> None:
                     episode_id,
                     _safe_message(exc, generic=_GENERIC_PROCESSING_FAILURE_MESSAGE),
                 )
-                raise  # arq retries the task
+                raise Retry(defer=RETRY_DEFER_SECONDS) from exc
 
             logger.error(
                 "Processing failed permanently for episode %s after %s attempt(s): %s",
@@ -268,13 +316,20 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
             # (a later POST just kept returning the same permanently
             # "active" job -- see ArticleService.request_generation).
             #
-            # Always mark this attempt failed here, unconditionally: if
-            # arq's own retry policy invokes this task again, the next
-            # invocation's mark_running() above immediately overwrites
-            # this with RUNNING again (harmless); if this was the final
-            # attempt, FAILED is the correct terminal state instead of a
-            # permanent, unrecoverable ANALYZING/RUNNING. Never swallow
-            # the cancellation itself -- re-raise so arq observes it as it
+            # Always mark this attempt failed here, unconditionally: this
+            # task cannot distinguish, from inside a CancelledError handler,
+            # whether arq is about to genuinely retry this job_id (a
+            # worker-shutdown-triggered cancellation, which arq's Worker
+            # treats as retry-eligible) or whether this is terminal (arq's
+            # own job_timeout expiry, which is NOT retried -- verified
+            # directly against the installed arq version: a timeout surfaces
+            # to arq's own run_job as TimeoutError, not CancelledError, and
+            # falls straight to its terminal-failure branch). If arq does
+            # retry this job_id, the next invocation's mark_running() above
+            # immediately overwrites this with RUNNING again (harmless); if
+            # this was actually terminal, FAILED is correct instead of a
+            # permanent, unrecoverable ANALYZING/RUNNING. Never swallow the
+            # cancellation itself -- re-raise so arq observes it as it
             # expects.
             await session.rollback()
             logger.error(
@@ -297,7 +352,7 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                     episode_id,
                     _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE),
                 )
-                raise  # arq retries the task
+                raise Retry(defer=RETRY_DEFER_SECONDS) from exc
 
             logger.error(
                 "Article generation failed permanently for episode %s after %s attempt(s): %s",

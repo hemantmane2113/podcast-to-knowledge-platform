@@ -2,9 +2,14 @@ import asyncio
 import uuid
 
 import pytest
+from arq import Retry
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from app.core.exceptions import TranscriptProviderAuthError, TranscriptProviderError
+from app.core.exceptions import (
+    LLMProviderTransientError,
+    TranscriptProviderAuthError,
+    TranscriptProviderError,
+)
 from app.models.chunk import Chunk
 from app.models.episode import Episode, ProcessingStatus
 from app.models.processing_job import JobStatus, JobType, ProcessingJob
@@ -15,9 +20,24 @@ from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.repositories.transcript_repository import TranscriptRepository
 from app.schemas.transcript import NormalizedSegment, NormalizedTranscript
 from app.services.chunking_service import ChunkCandidate
-from app.worker.tasks import MAX_TRIES, generate_article, ingest_episode_transcript, process_transcript
+from app.services.transcript_processing_service import TranscriptProcessingService
+from app.worker.tasks import (
+    MAX_TRIES,
+    RETRY_DEFER_SECONDS,
+    generate_article,
+    ingest_episode_transcript,
+    process_transcript,
+)
 from tests.conftest import TEST_DATABASE_URL
 from tests.fakes import FakeJobQueue, FakeLLMProvider, StubProvider
+
+
+class _RetryableTestError(Exception):
+    """A minimal stand-in for a transient failure in code paths (like
+    TranscriptProcessingService, purely local computation) that don't
+    naturally raise one of app.core.exceptions' own retryable types."""
+
+    retryable = True
 
 VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -106,22 +126,80 @@ async def test_non_retryable_failure_marks_failed_immediately_without_raising(
     assert refreshed_job.error_message == "bad key"
 
 
-async def test_retryable_failure_raises_to_let_arq_retry_on_non_final_attempt(
+async def test_retryable_failure_raises_arq_retry_on_attempt_1(
     db_session: AsyncSession,
 ) -> None:
+    """Regression test: this task must raise `arq.Retry`, not a bare
+    re-raise of the original exception -- verified directly against the
+    installed arq version (0.28.0) that only `arq.Retry` (or
+    CancelledError/RetryJob under retry_jobs=True) causes arq to actually
+    re-invoke the same job_id. A bare re-raise of an ordinary exception is
+    treated by arq as an immediate terminal failure with no retry ever
+    happening -- which is exactly how the real incident (job
+    5f27dcad-b02a-4872-8a3d-639215ac77ce) ended up ARQ-failed but
+    Postgres-RUNNING forever. The old version of this test asserted only
+    the DB-state side of that bug and called it correct."""
     episode, job = await _seed_episode_and_job(db_session)
     ctx = {
         "job_try": 1,  # first of MAX_TRIES attempts
         "provider": StubProvider(transcript=TranscriptProviderError("transient failure")),
     }
 
-    with pytest.raises(TranscriptProviderError):
+    with pytest.raises(Retry) as exc_info:
+        await ingest_episode_transcript(ctx, str(episode.id), str(job.id))
+    assert exc_info.value.defer_score == RETRY_DEFER_SECONDS * 1000
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    # Not yet terminal, and untouched by this attempt -- arq will retry
+    # this exact job_id; our own code must not mark it FAILED here.
+    assert refreshed_episode.status == ProcessingStatus.INGESTING
+    assert refreshed_job.status == JobStatus.RUNNING
+    assert refreshed_job.error_message is None
+
+
+async def test_retryable_failure_raises_arq_retry_on_attempt_2(
+    db_session: AsyncSession,
+) -> None:
+    """Same as attempt 1, but at job_try=2 (the middle of a MAX_TRIES=3
+    sequence) -- confirms `ctx["job_try"]` is read correctly at any
+    position, not just the first attempt."""
+    episode, job = await _seed_episode_and_job(db_session)
+    ctx = {
+        "job_try": 2,
+        "provider": StubProvider(transcript=TranscriptProviderError("still transient")),
+    }
+
+    with pytest.raises(Retry):
         await ingest_episode_transcript(ctx, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    # Not yet terminal -- arq is expected to retry this job.
     assert refreshed_episode.status == ProcessingStatus.INGESTING
     assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_ingest_episode_transcript_cancellation_marks_failed(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors generate_article's existing cancellation regression test --
+    ingestion had no CancelledError handler at all before this fix, so a
+    job_timeout during ingestion left the row stuck exactly like the
+    original generate_article incident."""
+    episode, job = await _seed_episode_and_job(db_session)
+
+    async def _cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    from app.services.ingestion_service import IngestionService
+
+    monkeypatch.setattr(IngestionService, "run", _cancelled)
+    ctx = {"job_try": 1, "provider": StubProvider(transcript=Exception("unused"))}
+
+    with pytest.raises(asyncio.CancelledError):
+        await ingest_episode_transcript(ctx, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
 
 
 async def test_missing_provider_marks_failed_without_raising(db_session: AsyncSession) -> None:
@@ -242,6 +320,84 @@ async def test_process_transcript_missing_transcript_fails_without_raising(
 
     # No transcript exists for this episode -- non-retryable (TranscriptNotFoundError).
     await process_transcript({"job_try": 1}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_process_transcript_retryable_failure_raises_arq_retry_on_attempt_1(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode, transcript, job = await _seed_episode_with_transcript(db_session)
+
+    async def _raise(*_args, **_kwargs):
+        raise _RetryableTestError("transient DB blip")
+
+    monkeypatch.setattr(TranscriptProcessingService, "run", _raise)
+
+    with pytest.raises(Retry) as exc_info:
+        await process_transcript({"job_try": 1}, str(episode.id), str(job.id))
+    assert exc_info.value.defer_score == RETRY_DEFER_SECONDS * 1000
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
+    assert refreshed_job.status == JobStatus.RUNNING
+    assert refreshed_job.error_message is None
+
+
+async def test_process_transcript_retryable_failure_raises_arq_retry_on_attempt_2(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode, transcript, job = await _seed_episode_with_transcript(db_session)
+
+    async def _raise(*_args, **_kwargs):
+        raise _RetryableTestError("still failing")
+
+    monkeypatch.setattr(TranscriptProcessingService, "run", _raise)
+
+    with pytest.raises(Retry):
+        await process_transcript({"job_try": 2}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_process_transcript_retryable_failure_marks_failed_on_final_attempt(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode, transcript, job = await _seed_episode_with_transcript(db_session)
+
+    async def _raise(*_args, **_kwargs):
+        raise _RetryableTestError("still failing")
+
+    monkeypatch.setattr(TranscriptProcessingService, "run", _raise)
+
+    # Must NOT raise -- attempts are exhausted, this is the terminal failure.
+    await process_transcript({"job_try": MAX_TRIES}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+    assert refreshed_job.error_message == "Transcript processing failed. See server logs for details."
+
+
+async def test_process_transcript_cancellation_marks_failed(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors generate_article's existing cancellation regression test --
+    process_transcript had no CancelledError handler at all before this
+    fix."""
+    episode, transcript, job = await _seed_episode_with_transcript(db_session)
+
+    async def _cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(TranscriptProcessingService, "run", _cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await process_transcript({"job_try": 1}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
     assert refreshed_episode.status == ProcessingStatus.FAILED
@@ -481,6 +637,191 @@ async def test_generate_article_marks_failed_on_cancellation_instead_of_leaving_
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
     assert refreshed_episode.status == ProcessingStatus.FAILED
     assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_retryable_failure_raises_arq_retry_on_attempt_1(
+    db_session: AsyncSession,
+) -> None:
+    """This is the exact shape of the real incident (job
+    5f27dcad-b02a-4872-8a3d-639215ac77ce): Groq 429 -> OpenAI fallback ->
+    OpenAI 60s timeout, mapped by app/providers/llm/_chat_completions.py's
+    map_sdk_exception to LLMProviderTransientError(retryable=True), raised
+    out of the topic-analysis node's first generate_structured call."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    failing_llm = FakeLLMProvider(structured_responses=[LLMProviderTransientError("Request timed out.")])
+    ctx = {"job_try": 1, "llm_provider": failing_llm}
+
+    with pytest.raises(Retry) as exc_info:
+        await generate_article(ctx, str(episode.id), str(job.id))
+    assert exc_info.value.defer_score == RETRY_DEFER_SECONDS * 1000
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    # topic_analysis_node sets ANALYZING (and commits) before making its
+    # LLM call, so that status is legitimately visible here -- this is not
+    # a bug, just where the failure occurred within the pipeline.
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_job.status == JobStatus.RUNNING
+    assert refreshed_job.error_message is None
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    assert article is None
+
+
+async def test_generate_article_retryable_failure_raises_arq_retry_on_attempt_2(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    failing_llm = FakeLLMProvider(structured_responses=[LLMProviderTransientError("still failing")])
+    ctx = {"job_try": 2, "llm_provider": failing_llm}
+
+    with pytest.raises(Retry):
+        await generate_article(ctx, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_job.status == JobStatus.RUNNING
+
+
+async def test_generate_article_retryable_failure_marks_failed_on_final_attempt(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    failing_llm = FakeLLMProvider(structured_responses=[LLMProviderTransientError("still failing")])
+    ctx = {"job_try": MAX_TRIES, "llm_provider": failing_llm}
+
+    # Must NOT raise -- attempts are exhausted, this is the terminal failure.
+    await generate_article(ctx, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_job.status == JobStatus.FAILED
+    assert refreshed_job.error_message == "still failing"
+
+
+async def test_generate_article_succeeds_on_a_genuine_retry_after_attempt_1_fails(
+    db_session: AsyncSession,
+) -> None:
+    """Simulates the exact sequence arq itself performs once Retry is
+    raised: the SAME job_id is re-invoked later with job_try incremented.
+    Attempt 1 fails transiently (no article, no persisted work at all --
+    the failure is in topic analysis, the very first LLM call); attempt 2,
+    against a fully-succeeding provider, completes normally."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    failing_llm = FakeLLMProvider(structured_responses=[LLMProviderTransientError("transient")])
+
+    with pytest.raises(Retry):
+        await generate_article({"job_try": 1, "llm_provider": failing_llm}, str(episode.id), str(job.id))
+
+    succeeding_llm = _fake_llm_provider()
+    await generate_article({"job_try": 2, "llm_provider": succeeding_llm}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_job.status == JobStatus.COMPLETED
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    assert article is not None
+    assert len(article.sections) == 3
+
+
+async def test_generate_article_retry_resumes_from_already_persisted_sections(
+    db_session: AsyncSession,
+) -> None:
+    """Resumability (Batch 2B) interacting with a genuine arq retry
+    (rather than a separately-submitted job, which is all the existing
+    resumability integration tests exercise): attempt 1 completes topic
+    analysis, planning, and the first section, then fails transiently
+    while generating the second section. Attempt 2 (job_try=2, same
+    job_id -- the real arq retry shape) must reuse everything already
+    persisted rather than regenerating it, and must complete successfully."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    from app.ai.schemas import ArticlePlanResult, GeneratedSection, PlannedSection, TopicAnalysisResult, TopicItem
+
+    attempt_1_llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0])]),
+            ArticlePlanResult(
+                title="The Article",
+                introduction_summary="i",
+                sections=[
+                    PlannedSection(heading="Intro", supporting_topic_sequence_numbers=[0]),
+                    PlannedSection(heading="Body", supporting_topic_sequence_numbers=[0]),
+                    PlannedSection(heading="Conclusion", supporting_topic_sequence_numbers=[0]),
+                ],
+                conclusion_summary="c",
+            ),
+            GeneratedSection(heading="Intro", content=" ".join(["intro"] + ["word"] * 149)),
+            LLMProviderTransientError("transient failure generating Body"),
+        ]
+    )
+
+    with pytest.raises(Retry):
+        await generate_article({"job_try": 1, "llm_provider": attempt_1_llm}, str(episode.id), str(job.id))
+
+    # Confirms the premise: attempt 1 really did persist topic analysis,
+    # planning, and exactly one section before failing.
+    article_after_attempt_1 = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    assert article_after_attempt_1 is not None
+    assert len(article_after_attempt_1.sections) == 1
+    assert article_after_attempt_1.sections[0].heading == "Intro"
+
+    attempt_2_llm = FakeLLMProvider(
+        structured_responses=[
+            GeneratedSection(heading="Body", content=" ".join(["body"] + ["word"] * 149)),
+            GeneratedSection(heading="Conclusion", content=" ".join(["conclusion"] + ["word"] * 149)),
+        ]
+    )
+    await generate_article({"job_try": 2, "llm_provider": attempt_2_llm}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_job.status == JobStatus.COMPLETED
+
+    # A fresh session/engine, not db_session -- db_session's identity map
+    # already holds article_after_attempt_1's Article (id and all), loaded
+    # BEFORE attempt 2 committed its writes through generate_article's own,
+    # separate session; with expire_on_commit=False, re-querying through
+    # db_session would just hand back that same, now-stale Python object
+    # instead of observing what attempt 2 actually persisted (the same
+    # reasoning _reload's own docstring documents for episode/job).
+    engine = create_async_engine(TEST_DATABASE_URL)
+    try:
+        async with AsyncSession(bind=engine) as fresh_session:
+            final_article = await ArticleRepository(fresh_session).get_by_episode_id(episode.id)
+    finally:
+        await engine.dispose()
+
+    assert final_article.id == article_after_attempt_1.id
+    assert len(final_article.sections) == 3
+    # Attempt 2 only had to pay for the two missing sections -- topic
+    # analysis, planning, and the already-persisted "Intro" section cost
+    # it nothing.
+    assert len(attempt_2_llm.structured_calls) == 2
+
+
+async def test_generate_article_two_historical_jobs_for_the_same_episode_do_not_interfere(
+    db_session: AsyncSession,
+) -> None:
+    """A second, separately-created ProcessingJob for the same episode
+    (e.g. a user retriggering generation after reviewing the first result)
+    must operate correctly regardless of the first job's historical
+    row -- ProcessingJobRepository has no uniqueness constraint tying an
+    episode to a single job row, by design (see
+    ProcessingJobRepository.get_active_job's docstring)."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+    await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
+
+    second_job = ProcessingJobRepository(db_session).create(
+        episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION
+    )
+    await db_session.commit()
+    await generate_article(
+        {"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(second_job.id)
+    )
+
+    refreshed_episode, refreshed_first_job = await _reload(episode.id, job.id)
+    _, refreshed_second_job = await _reload(episode.id, second_job.id)
+    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_first_job.status == JobStatus.COMPLETED
+    assert refreshed_second_job.status == JobStatus.COMPLETED
 
 
 async def test_generate_article_is_idempotent_on_rerun(db_session: AsyncSession) -> None:
