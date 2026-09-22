@@ -17,12 +17,23 @@ class ProcessingJobRepository:
     async def get_active_job(
         self, episode_id: uuid.UUID, job_type: JobType
     ) -> ProcessingJob | None:
+        """The newest PENDING/RUNNING job, if any. More than one active row
+        can genuinely exist for the same (episode_id, job_type) -- nothing
+        enforces uniqueness at the DB level, and a worker process dying
+        mid-job (rather than going through its own except-block) leaves a
+        row stuck at PENDING/RUNNING forever. `.order_by(...).limit(1)`
+        makes `scalar_one_or_none()` safe (at most one row can come back);
+        without it, a second stuck active row raises MultipleResultsFound
+        -- found via a real production DB with historical jobs."""
         result = await self._session.execute(
-            select(ProcessingJob).where(
+            select(ProcessingJob)
+            .where(
                 ProcessingJob.episode_id == episode_id,
                 ProcessingJob.job_type == job_type,
                 ProcessingJob.status.in_((JobStatus.PENDING, JobStatus.RUNNING)),
             )
+            .order_by(ProcessingJob.created_at.desc())
+            .limit(1)
         )
         return result.scalar_one_or_none()
 

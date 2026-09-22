@@ -125,6 +125,46 @@ async def test_generate_article_allows_a_fresh_attempt_after_a_failed_job(
     assert queue.enqueued_article_generation[0] == (episode.id, new_job_id)
 
 
+async def test_generate_article_with_multiple_historical_failed_jobs_does_not_500(
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end version of the real production shape reported: several
+    historical FAILED ARTICLE_GENERATION jobs accumulated for the same
+    episode across repeated attempts. Confirms the real endpoint still
+    creates a fresh job cleanly (no 500, no MultipleResultsFound) and
+    leaves every historical row untouched -- the repository-level
+    multiple-active-rows case is covered directly in
+    test_processing_job_repository.py."""
+    episode, _ = await _seed_episode_and_transcript(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    failed_job_ids = []
+    for _ in range(3):
+        job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+        await db_session.commit()
+        jobs.mark_failed(job, "old max_tokens=null failure")
+        await db_session.commit()
+        failed_job_ids.append(job.id)
+
+    queue = FakeJobQueue()
+    client = await _client(db_session, queue)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/generate-article")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 202
+    new_job_id = uuid.UUID(response.json()["job_id"])
+    assert new_job_id not in failed_job_ids
+    assert len(queue.enqueued_article_generation) == 1
+
+    # All three historical FAILED jobs are still present, untouched.
+    for job_id in failed_job_ids:
+        historical = await jobs.get_by_id(job_id)
+        assert historical is not None
+        assert historical.status == JobStatus.FAILED
+
+
 async def _seed_completed_article(session: AsyncSession, episode: Episode, transcript: Transcript) -> None:
     await ChunkRepository(session).replace_all(
         transcript_id=transcript.id,
