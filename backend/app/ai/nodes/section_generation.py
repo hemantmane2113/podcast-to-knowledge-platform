@@ -6,8 +6,16 @@ outline for structural awareness -- plus the fidelity/attribution
 constraints in app/ai/prompts.py. generate_section() is also used by
 app/ai/nodes/revision.py to regenerate just the sections a failed
 validation flagged.
+
+Resumability (Batch 2B): each section is persisted (and committed)
+immediately after its own LLM call succeeds, and a section already
+persisted from a prior attempt is reused (no LLM call at all) rather than
+regenerated -- see section_generation_node below. A worker crash after
+section N therefore leaves sections 1..N durably available to the next
+attempt; only the remaining, still-missing sections are ever regenerated.
 """
 
+import logging
 import uuid
 
 from app.ai.prompts import section_generation_prompt
@@ -18,6 +26,9 @@ from app.models.episode import ProcessingStatus
 from app.models.topic import Topic
 from app.providers.llm.base import LLMMessage
 from app.repositories.article_repository import ArticleSectionCandidate
+from app.services.article_validation import is_section_content_valid
+
+logger = logging.getLogger(__name__)
 
 
 def section_headings_by_sequence(plan_sections: list[dict]) -> list[str]:
@@ -87,27 +98,43 @@ def build(deps: PipelineDeps):
         topic_by_id = {t.id: t for t in state["topics"]}
         section_headings = section_headings_by_sequence(plan.sections)
 
-        candidates = []
-        for planned_section in plan.sections:
-            candidates.append(
-                await generate_section(
-                    deps,
-                    planned_section,
-                    chunk_by_id,
-                    topic_by_id,
-                    article_title=plan.title,
-                    section_headings=section_headings,
-                )
-            )
-
-        article = await deps.articles.replace(
+        # get_or_create reuses the existing Article (sections and all) if
+        # it already belongs to this plan -- see its docstring for the
+        # identity guard against ever reusing one that doesn't.
+        article = await deps.articles.get_or_create(
             episode_id=state["episode_id"],
             article_plan_id=plan.id,
             title=plan.title,
             revision_count=state.get("revision_count", 0),
-            sections=candidates,
         )
         await deps.session.commit()
+
+        existing_by_sequence = {s.sequence_number: s for s in article.sections}
+
+        for planned_section in plan.sections:
+            seq = planned_section["sequence_number"]
+            existing = existing_by_sequence.get(seq)
+            if existing is not None and is_section_content_valid(existing.heading, existing.content):
+                # Already generated (and valid) in a prior attempt -- no
+                # LLM call, no write.
+                logger.info("Section generation: reusing already-persisted section %d", seq)
+                continue
+
+            candidate = await generate_section(
+                deps,
+                planned_section,
+                chunk_by_id,
+                topic_by_id,
+                article_title=plan.title,
+                section_headings=section_headings,
+            )
+            # Persisted (and committed) immediately after this section's
+            # own LLM call succeeds -- a failed/raising call never reaches
+            # this line, so a failed section is never persisted as if it
+            # were complete (see upsert_section's docstring for the
+            # invalid-existing-row replace-in-place case).
+            deps.articles.upsert_section(article, candidate)
+            await deps.session.commit()
 
         return {"article": article}
 

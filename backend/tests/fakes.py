@@ -66,7 +66,10 @@ class FakeLLMProvider(LLMProvider):
     `structured_responses` is consumed in order, one per
     generate_structured() call (so a test can program a topic-analysis
     response, then a planning response, then per-section responses, in
-    the sequence the graph will actually call them).
+    the sequence the graph will actually call them). An entry may also be
+    an Exception instance, which is raised instead of returned -- lets a
+    test simulate a call failing (e.g. a worker crash mid-pipeline) at a
+    specific point in the sequence, same convention as StubProvider below.
     """
 
     def __init__(
@@ -104,6 +107,12 @@ class FakeLLMProvider(LLMProvider):
         if not self._structured_responses:
             raise AssertionError("FakeLLMProvider ran out of programmed structured responses")
         response = self._structured_responses.pop(0)
+        if isinstance(response, Exception):
+            # Same "program an Exception, it gets raised" convention as
+            # StubProvider above -- lets a test simulate a call that fails
+            # (e.g. a worker crash mid-pipeline) at a specific, chosen
+            # point in the response sequence.
+            raise response
         if not isinstance(response, response_model):
             raise AssertionError(
                 f"programmed response {type(response).__name__} doesn't match "

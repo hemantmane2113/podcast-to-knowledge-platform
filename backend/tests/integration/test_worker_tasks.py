@@ -490,10 +490,19 @@ async def test_generate_article_is_idempotent_on_rerun(db_session: AsyncSession)
 
     second_job = ProcessingJobRepository(db_session).create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
     await db_session.commit()
+    second_llm = _fake_llm_provider()
     await generate_article(
-        {"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(second_job.id)
+        {"job_try": 1, "llm_provider": second_llm}, str(episode.id), str(second_job.id)
     )
     second_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
 
-    assert second_article.id != first_article.id  # delete-then-reinsert, same as Chunk/Topic
+    # Batch 2B (resumability): the first run already produced a complete,
+    # valid article, so the second run reuses it entirely -- same row, zero
+    # LLM calls -- rather than blindly regenerating from scratch. Stronger
+    # than the pre-Batch-2B "delete-then-reinsert" behavior this replaces:
+    # that was idempotent in name only (same *content*, wastefully
+    # recomputed); this is idempotent in the sense that actually matters
+    # for a paid pipeline -- no repeated work at all.
+    assert second_article.id == first_article.id
     assert second_article.title == first_article.title
+    assert len(second_llm.structured_calls) == 0

@@ -85,11 +85,19 @@ def check_source_traceability(
 # --- 3. No empty sections -------------------------------------------------------------
 
 
+def is_section_content_valid(heading: str, content: str) -> bool:
+    """The same minimal validity bar check_no_empty_sections enforces
+    below, factored out so app/ai/nodes/section_generation.py can reuse it
+    to decide whether an already-persisted ArticleSection represents
+    genuinely completed work (safe to reuse on a resumed job) or must be
+    regenerated -- the strongest existing deterministic signal, rather
+    than inventing a separate stage-completion marker."""
+    return bool(heading.strip()) and len(content.strip()) >= _MIN_SECTION_CONTENT_CHARS
+
+
 def check_no_empty_sections(sections: list[ArticleSection]) -> CheckResult:
     empty = [
-        s.sequence_number
-        for s in sections
-        if not s.heading.strip() or len(s.content.strip()) < _MIN_SECTION_CONTENT_CHARS
+        s.sequence_number for s in sections if not is_section_content_valid(s.heading, s.content)
     ]
     # "section N" phrasing per flagged section (not a bare list) so
     # app/ai/nodes/revision.py's regex-based targeting can regenerate

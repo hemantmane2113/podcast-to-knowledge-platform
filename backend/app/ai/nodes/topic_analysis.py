@@ -24,11 +24,28 @@ from app.ai.schemas import TopicAnalysisResult, TopicClaim, TopicItem, TopicMerg
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.chunk import Chunk
 from app.models.episode import ProcessingStatus
+from app.models.topic import Topic
 from app.providers.llm.base import LLMMessage
 from app.repositories.topic_repository import TopicCandidate
 from app.services.chunking_service import estimate_tokens
 
 logger = logging.getLogger(__name__)
+
+
+def _topics_are_complete(topics: list[Topic]) -> bool:
+    """Resumability's stage-completion signal for topic analysis (Batch
+    2B): TopicRepository.replace_all is the only writer, called exactly
+    once with the FULL final topic list after batching/reconciliation is
+    entirely done -- so any row existing at all for this transcript means
+    that call (and its commit) already succeeded, i.e. topic analysis
+    previously ran to completion. The per-row sanity check below is a
+    basic guard against trusting a corrupt/degenerate row as completed
+    work, not a separate stage-completion marker -- there is no
+    partial-write state to distinguish here, unlike sections (see
+    app/ai/nodes/section_generation.py), since topics are only ever
+    persisted all at once.
+    """
+    return bool(topics) and all(t.title.strip() and t.summary.strip() for t in topics)
 
 
 def _batch_chunks(chunks: list[Chunk], token_budget: int) -> list[list[Chunk]]:
@@ -196,6 +213,20 @@ def build(deps: PipelineDeps):
         if episode is not None:
             deps.episodes.set_status(episode, ProcessingStatus.ANALYZING)
             await deps.session.commit()
+
+        # Resumability (Batch 2B): a prior attempt for this episode/job may
+        # already have completed topic analysis before a worker crash or
+        # ARQ retry -- reuse that work instead of paying for the batch/merge
+        # LLM calls again. See _topics_are_complete's docstring for why
+        # "any row exists" is already the right completion signal here.
+        existing_topics = await deps.topics.get_by_transcript_id(state["transcript_id"])
+        if _topics_are_complete(existing_topics):
+            logger.info(
+                "Topic analysis: reusing %d already-persisted topic(s) for transcript %s",
+                len(existing_topics),
+                state["transcript_id"],
+            )
+            return {"topics": existing_topics}
 
         chunks = state["chunks"]
         batches = _batch_chunks(chunks, deps.settings.topic_analysis_token_budget)

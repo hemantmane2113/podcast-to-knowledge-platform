@@ -2,12 +2,28 @@
 -- never the full chunk text, so this stays well within context even for
 a very long transcript."""
 
+import logging
+
 from app.ai.prompts import planning_prompt
 from app.ai.schemas import ArticlePlanResult
 from app.ai.state import ArticlePipelineState, PipelineDeps
+from app.models.article_plan import ArticlePlan
 from app.models.episode import ProcessingStatus
 from app.providers.llm.base import LLMMessage
 from app.repositories.article_plan_repository import PlannedSectionData
+
+logger = logging.getLogger(__name__)
+
+
+def _plan_is_complete(plan: ArticlePlan | None) -> bool:
+    """Resumability's stage-completion signal for planning (Batch 2B):
+    ArticlePlanRepository.replace is the only writer, called exactly once
+    with the full final plan -- so a persisted row already reflects a
+    successful planning_node run. Non-blank title + at least one section
+    is a basic sanity guard against trusting a corrupt/degenerate row,
+    not a separate completion marker (same reasoning as
+    topic_analysis._topics_are_complete)."""
+    return plan is not None and bool(plan.title.strip()) and bool(plan.sections)
 
 
 def build(deps: PipelineDeps):
@@ -16,6 +32,19 @@ def build(deps: PipelineDeps):
         if episode is not None:
             deps.episodes.set_status(episode, ProcessingStatus.PLANNING)
             await deps.session.commit()
+
+        # Resumability (Batch 2B): reuse an already-persisted plan from a
+        # prior attempt at this episode's generation rather than calling
+        # the planner again -- critical not just for cost but for safety,
+        # since ArticlePlanRepository.replace cascades-deletes the current
+        # Article/sections (Article.article_plan_id FK ondelete=CASCADE);
+        # skipping the call when a valid plan already exists is what keeps
+        # section_generation_node's own incrementally-persisted sections
+        # (see app/ai/nodes/section_generation.py) alive across a retry.
+        existing_plan = await deps.article_plans.get_by_episode_id(state["episode_id"])
+        if _plan_is_complete(existing_plan):
+            logger.info("Planning: reusing already-persisted article plan %s", existing_plan.id)
+            return {"plan": existing_plan}
 
         topics = state["topics"]
         topics_by_sequence = {t.sequence_number: t for t in topics}
