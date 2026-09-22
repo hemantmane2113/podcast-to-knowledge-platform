@@ -198,3 +198,122 @@ async def test_non_provider_exception_is_never_retryable_and_propagates() -> Non
     with pytest.raises(RuntimeError):
         await provider.generate(messages=_MESSAGES)
     assert fallback.generate_calls == 0
+
+
+# --- sticky fallback: once activated, stays on the fallback for the rest ------------
+# --- of this FallbackLLMProvider instance's life (one instance == one job) ----------
+
+
+async def test_repeated_primary_successes_never_touch_the_fallback() -> None:
+    # (1) Primary succeeds -- all calls use primary, every time, not just the first.
+    primary = _FakeProvider("groq")
+    fallback = _FakeProvider("openai")
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    for _ in range(3):
+        response = await provider.generate(messages=_MESSAGES)
+        assert response.text == "from groq"
+
+    assert primary.generate_calls == 3
+    assert fallback.generate_calls == 0
+
+
+async def test_sticky_fallback_activates_after_first_retryable_failure() -> None:
+    # (2) First primary call gets a retryable error -> fallback is used.
+    primary = _FakeProvider("groq", error=LLMProviderRateLimitError("429"))
+    fallback = _FakeProvider("openai")
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    response = await provider.generate_structured(messages=_MESSAGES, response_model=_Example)
+
+    assert response.title == "openai"
+    assert primary.generate_structured_calls == 1
+    assert fallback.generate_structured_calls == 1
+
+
+async def test_sticky_fallback_skips_primary_on_every_subsequent_call() -> None:
+    # (3) Second and subsequent calls after fallback -> primary is NOT
+    # called again; fallback is used directly.
+    primary = _FakeProvider("groq", error=LLMProviderRateLimitError("429"))
+    fallback = _FakeProvider("openai")
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    first = await provider.generate_structured(messages=_MESSAGES, response_model=_Example)
+    second = await provider.generate_structured(messages=_MESSAGES, response_model=_Example)
+    third = await provider.generate_structured(messages=_MESSAGES, response_model=_Example)
+
+    assert first.title == second.title == third.title == "openai"
+    # Primary was tried exactly once -- for the call that discovered it
+    # was down. Every later call went straight to the fallback.
+    assert primary.generate_structured_calls == 1
+    assert fallback.generate_structured_calls == 3
+
+
+async def test_sticky_fallback_also_applies_across_the_two_llm_methods() -> None:
+    # Sticky state is shared: a generate_structured() failure sticks for
+    # a later generate() call too, and vice versa -- there's one job, one
+    # provider instance, one "is the primary down" fact.
+    primary = _FakeProvider("groq", error=LLMProviderTransientError("500"))
+    fallback = _FakeProvider("openai")
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    await provider.generate_structured(messages=_MESSAGES, response_model=_Example)
+    response = await provider.generate(messages=_MESSAGES)
+
+    assert response.text == "from openai"
+    assert primary.generate_calls == 0  # never tried -- sticky was already active
+    assert fallback.generate_calls == 1
+
+
+async def test_non_retryable_primary_failure_never_activates_sticky_fallback() -> None:
+    # (4) Non-retryable primary error -> fallback is NOT activated, and a
+    # later call still tries the primary again (nothing was learned from
+    # a non-retryable failure -- it's not evidence the primary is down).
+    primary = _FakeProvider("groq", error=LLMProviderRequestError("malformed"))
+    fallback = _FakeProvider("openai")
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    with pytest.raises(LLMProviderRequestError):
+        await provider.generate(messages=_MESSAGES)
+    with pytest.raises(LLMProviderRequestError):
+        await provider.generate(messages=_MESSAGES)
+
+    assert primary.generate_calls == 2  # tried again, not skipped
+    assert fallback.generate_calls == 0
+
+
+async def test_fallback_failure_does_not_activate_sticky_state() -> None:
+    # (5) Fallback itself fails -> the fallback's error is surfaced
+    # (unchanged from before), and sticky is NOT set -- a fallback call
+    # that never actually succeeded must not be trusted for later calls.
+    primary = _FakeProvider("groq", error=LLMProviderRateLimitError("429"))
+    fallback = _FakeProvider("openai", error=LLMProviderAuthError("OPENAI_API_KEY is not configured"))
+    provider = FallbackLLMProvider(primary=primary, fallback=fallback)
+
+    with pytest.raises(LLMProviderAuthError):
+        await provider.generate(messages=_MESSAGES)
+
+    assert primary.generate_calls == 1
+    assert fallback.generate_calls == 1
+
+
+async def test_a_new_job_starts_fresh_and_tries_primary_again() -> None:
+    # (6) A new article-generation job constructs a brand-new
+    # FallbackLLMProvider (app.providers.llm.factory.get_llm_provider is
+    # never cached across jobs) -- sticky state from a previous job's
+    # instance must never leak into a new one.
+    old_primary = _FakeProvider("groq", error=LLMProviderRateLimitError("429"))
+    old_fallback = _FakeProvider("openai")
+    old_job_provider = FallbackLLMProvider(primary=old_primary, fallback=old_fallback)
+    await old_job_provider.generate(messages=_MESSAGES)
+    assert old_fallback.generate_calls == 1  # sticky is now active on this instance
+
+    new_primary = _FakeProvider("groq")
+    new_fallback = _FakeProvider("openai")
+    new_job_provider = FallbackLLMProvider(primary=new_primary, fallback=new_fallback)
+
+    response = await new_job_provider.generate(messages=_MESSAGES)
+
+    assert response.text == "from groq"
+    assert new_primary.generate_calls == 1
+    assert new_fallback.generate_calls == 0

@@ -34,6 +34,36 @@ class TopicAnalysisResult(BaseModel):
     topics: list[TopicItem]
 
 
+class TopicMergeGroup(BaseModel):
+    """Two or more boundary-candidate topics (see
+    app/ai/nodes/topic_analysis.py's _boundary_candidate_indices) that the
+    model has decided are the same topic split across a batch boundary.
+    `topic_indices` refers to the index each candidate was given in the
+    boundary-merge prompt -- never a raw UUID (same reasoning as
+    TopicItem.chunk_sequence_numbers above).
+
+    Deliberately narrow: only the two fields that are genuinely a semantic
+    judgment (a new title/summary covering the merged topic) come from the
+    model. chunk_sequence_numbers, key_claims, and subtopics for the
+    merged topic are always reconstructed in Python from the ORIGINAL
+    topics being merged, never taken from the model's response -- so the
+    model has no opportunity to drop a chunk reference or a claim, even
+    accidentally.
+    """
+
+    topic_indices: list[int] = Field(default_factory=list)
+    merged_title: str
+    merged_summary: str
+
+
+class TopicMergeDecision(BaseModel):
+    """Response schema for the boundary-scoped topic merge call. Empty
+    `merges` means none of the boundary candidates should merge -- every
+    one of them is kept as its own original topic."""
+
+    merges: list[TopicMergeGroup] = Field(default_factory=list)
+
+
 class PlannedSection(BaseModel):
     heading: str
     key_ideas: list[str] = Field(default_factory=list)

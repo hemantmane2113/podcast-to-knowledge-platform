@@ -4,6 +4,7 @@ non-reusable-across-providers strings and that dependency would buy
 nothing here (see ARCHITECTURE.md's "no premature infrastructure").
 """
 
+from app.ai.schemas import TopicItem
 from app.models.chunk import Chunk
 from app.models.topic import Topic
 
@@ -52,17 +53,34 @@ def topic_analysis_prompt(chunks: list[Chunk], start_index: int) -> tuple[str, s
     return system, user
 
 
-def topic_merge_prompt(topics_json: str) -> tuple[str, str]:
+def topic_boundary_merge_prompt(candidates: list[tuple[int, TopicItem]]) -> tuple[str, str]:
+    """Returns (system, user) for the boundary-scoped topic merge call.
+
+    `candidates` are ONLY the topics next to a batch boundary (see
+    app/ai/nodes/topic_analysis.py's _boundary_candidate_indices) -- every
+    other topic has already been kept as-is by Python and is never shown
+    to the model. Each candidate's index (into the full, pre-merge topic
+    list) is given so a merge decision can reference it. Only a merged
+    title/summary is asked for -- chunk numbers, claims, and subtopics for
+    a merged topic are always reconstructed deterministically in Python
+    from the original topics (see TopicMergeGroup in app/ai/schemas.py),
+    so there's nothing for the model to renumber, invent, or drop.
+    """
     system = (
-        "You previously analyzed a long podcast transcript in separate batches and identified topics "
-        "in each batch independently. Some topics near a batch boundary may actually be the same topic "
-        "split in two, or two adjacent topics that should stay separate. Merge only where it is clearly "
-        "the same topic continuing; do not merge topics that are merely related. Preserve every chunk "
-        "number exactly as given -- do not renumber, invent, or drop any."
+        "You previously analyzed a long podcast transcript in separate batches. The topics below are "
+        "only the ones next to a batch boundary -- every other topic has already been kept as-is and "
+        "is not shown to you here. Some of these may actually be the same topic split in two by the "
+        "batch boundary; others are merely adjacent and should stay separate. Merge only where it is "
+        "clearly the same topic continuing across the boundary -- do not merge topics that are merely "
+        "related."
     )
+    topic_lines = "\n\n".join(f"[topic {index}] {item.title}\n{item.summary}" for index, item in candidates)
     user = (
-        f"Here are the per-batch topics as JSON:\n\n{topics_json}\n\n"
-        "Return the final, merged, ordered list of topics in the same schema."
+        f"Boundary-adjacent topics:\n\n{topic_lines}\n\n"
+        "For each group of topics that are actually the same topic, return the topic numbers (exactly "
+        "as given above, e.g. \"topic 7\" -> the integer 7) being merged, plus a merged title and "
+        "summary covering all of them. Omit any topic that should stay separate -- it will be kept as "
+        "its own topic automatically. If nothing should merge, return an empty list."
     )
     return system, user
 

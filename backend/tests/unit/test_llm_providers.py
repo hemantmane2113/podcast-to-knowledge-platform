@@ -507,6 +507,82 @@ async def test_generate_structured_fallback_to_openai_still_works_for_a_genuine_
     mock_openai_cls.return_value.chat.completions.create.assert_awaited_once()
 
 
+# --- sticky fallback composed with each provider's own local corrective retry ------
+# (app/providers/llm/fallback_provider.py + _chat_completions.py's
+# generate_structured() retry loop) -- proves the two retry layers don't
+# interfere with each other: a provider's own invalid-JSON retry never
+# touches FallbackLLMProvider's sticky state, whichever provider (primary
+# or, once sticky, the fallback) happens to be handling the call.
+
+
+async def test_primary_local_retry_succeeds_without_ever_triggering_fallback() -> None:
+    # (7a) Groq's own corrective retry (invalid JSON, then valid) resolves
+    # the call entirely within the primary -- OpenAI is never contacted,
+    # and sticky fallback is never activated.
+    with (
+        patch("app.providers.llm.groq_provider.AsyncGroq") as mock_groq_cls,
+        patch("app.providers.llm.openai_provider.AsyncOpenAI") as mock_openai_cls,
+    ):
+        mock_groq_cls.return_value.chat.completions.create = AsyncMock(
+            side_effect=[
+                _fake_completion("not valid json"),
+                _fake_completion(json.dumps({"title": "fixed", "count": 1})),
+            ]
+        )
+        mock_openai_cls.return_value.chat.completions.create = AsyncMock()
+
+        groq_provider = GroqProvider(api_key="k", model="m")
+        openai_provider = OpenAIProvider(api_key="k", model="m")
+        provider = FallbackLLMProvider(primary=groq_provider, fallback=openai_provider)
+
+        result = await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+
+    assert result == _Example(title="fixed", count=1)
+    assert mock_groq_cls.return_value.chat.completions.create.call_count == 2
+    mock_openai_cls.return_value.chat.completions.create.assert_not_awaited()
+
+
+async def test_sticky_fallback_local_retry_on_the_fallback_provider_still_works() -> None:
+    # (7b) Once sticky fallback is active, a later call that itself needs
+    # a corrective retry must be handled entirely by the fallback
+    # provider's own retry loop -- without ever going back to the primary.
+    with (
+        patch("app.providers.llm.groq_provider.AsyncGroq") as mock_groq_cls,
+        patch("app.providers.llm.openai_provider.AsyncOpenAI") as mock_openai_cls,
+    ):
+        mock_groq_cls.return_value.chat.completions.create = AsyncMock(
+            side_effect=groq.RateLimitError("slow down", response=_httpx_response(429), body=None)
+        )
+        mock_openai_cls.return_value.chat.completions.create = AsyncMock(
+            side_effect=[
+                _fake_completion(json.dumps({"title": "first-openai", "count": 1})),  # activates sticky
+                _fake_completion("not valid json"),  # 2nd call's own attempt 1
+                _fake_completion(json.dumps({"title": "second-openai", "count": 2})),  # 2nd call's retry
+            ]
+        )
+
+        groq_provider = GroqProvider(api_key="k", model="m")
+        openai_provider = OpenAIProvider(api_key="k", model="m")
+        provider = FallbackLLMProvider(primary=groq_provider, fallback=openai_provider)
+
+        first = await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+        second = await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json again")], response_model=_Example
+        )
+
+    assert first == _Example(title="first-openai", count=1)
+    assert second == _Example(title="second-openai", count=2)
+    # Groq was tried exactly once, ever -- the call that proved it was down.
+    assert mock_groq_cls.return_value.chat.completions.create.call_count == 1
+    # OpenAI handled the first call's single attempt plus the second
+    # call's own invalid-then-valid retry -- three attempts total.
+    assert mock_openai_cls.return_value.chat.completions.create.call_count == 3
+
+
 # --- concrete providers: client construction, end-to-end generate(), and -----------
 # --- each provider's own _map_exception against REAL SDK exception classes ---------
 # (the shared-base tests above only prove ChatCompletionsProvider itself is correct;

@@ -11,7 +11,14 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.graph import run_article_pipeline
-from app.ai.schemas import ArticlePlanResult, GeneratedSection, PlannedSection, TopicAnalysisResult, TopicItem
+from app.ai.schemas import (
+    ArticlePlanResult,
+    GeneratedSection,
+    PlannedSection,
+    TopicAnalysisResult,
+    TopicItem,
+    TopicMergeDecision,
+)
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config.settings import Settings
 from app.models.chunk import Chunk
@@ -186,12 +193,11 @@ async def test_topic_analysis_batches_when_chunks_exceed_token_budget(db_session
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Batch 0", summary="s", chunk_sequence_numbers=[0])]),
             TopicAnalysisResult(topics=[TopicItem(title="Batch 1", summary="s", chunk_sequence_numbers=[1])]),
-            TopicAnalysisResult(  # the merge call, since there were 2 batches
-                topics=[
-                    TopicItem(title="Batch 0", summary="s", chunk_sequence_numbers=[0]),
-                    TopicItem(title="Batch 1", summary="s", chunk_sequence_numbers=[1]),
-                ]
-            ),
+            # The boundary-merge call: both topics touch the batch seam
+            # (chunk 0 is batch 0's last chunk, chunk 1 is batch 1's first),
+            # so both are sent as candidates -- an empty decision means
+            # neither should merge, so both are kept exactly as produced.
+            TopicMergeDecision(merges=[]),
             ArticlePlanResult(
                 title="T", introduction_summary="i", sections=[], conclusion_summary="c"
             ),

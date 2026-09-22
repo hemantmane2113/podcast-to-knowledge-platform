@@ -7,11 +7,24 @@ request) is never retried against the fallback either -- switching
 providers wouldn't fix a bad credential or a bad request, and silently
 retrying would hide a real configuration problem instead of surfacing it.
 
-AI nodes (app/ai/nodes/) never see this: FallbackLLMProvider implements
-the same LLMProvider interface as GroqProvider/OpenAIProvider/
+Sticky per instance: once a fallback succeeds, every later call on THIS
+instance goes straight to the fallback provider -- the primary is not
+tried again for the rest of this instance's life. Without this, a
+sustained primary outage (e.g. a rate limit that doesn't clear for a
+while) makes every single call in a job independently retry-then-fail
+against the primary first, which is pure wasted latency once the first
+call has already shown the primary is down. This is deliberately scoped
+to *this instance*, not global/persistent state: app.providers.llm.factory
+.get_llm_provider constructs a new FallbackLLMProvider for every
+article-generation job (never cached/reused across jobs), so stickiness
+naturally resets for the next job with no explicit reset call, no DB
+write, and no change to global config.
+
+AI nodes (app/ai/nodes/) never see any of this: FallbackLLMProvider
+implements the same LLMProvider interface as GroqProvider/OpenAIProvider/
 OpenSourceProvider, so it's a drop-in substitute constructed once by
 app.providers.llm.factory.get_llm_provider -- nothing above the factory
-knows fallback exists.
+knows fallback (sticky or otherwise) exists.
 """
 
 import logging
@@ -29,6 +42,16 @@ class FallbackLLMProvider(LLMProvider):
     def __init__(self, primary: LLMProvider, fallback: LLMProvider):
         self._primary = primary
         self._fallback = fallback
+        # Flips to True only once a fallback call has actually *succeeded*
+        # (never merely attempted -- see generate()/generate_structured()
+        # below, both set this after the fallback call returns, inside the
+        # same try block whose except re-raises on failure without setting
+        # it). A local structured-output corrective retry never reaches
+        # this class at all -- it's fully contained inside whichever
+        # concrete provider (primary or fallback) is actually handling the
+        # call, in ChatCompletionsProvider.generate_structured -- so it
+        # can't observe or reset this flag either way.
+        self._use_fallback = False
 
     async def generate(
         self,
@@ -38,6 +61,10 @@ class FallbackLLMProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> LLMTextResponse:
+        if self._use_fallback:
+            return await self._fallback.generate(
+                messages=messages, system=system, temperature=temperature, max_tokens=max_tokens
+            )
         try:
             return await self._primary.generate(
                 messages=messages, system=system, temperature=temperature, max_tokens=max_tokens
@@ -53,8 +80,9 @@ class FallbackLLMProvider(LLMProvider):
             except Exception as fallback_exc:
                 self._log_fallback_failed(fallback_exc)
                 raise
+            self._use_fallback = True
             logger.info(
-                "LLM fallback provider succeeded provider=%s model=%s",
+                "LLM fallback provider succeeded provider=%s model=%s -- sticky for the rest of this job",
                 type(self._fallback).__name__,
                 result.model,
             )
@@ -69,6 +97,14 @@ class FallbackLLMProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> T:
+        if self._use_fallback:
+            return await self._fallback.generate_structured(
+                messages=messages,
+                response_model=response_model,
+                system=system,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         try:
             return await self._primary.generate_structured(
                 messages=messages,
@@ -92,7 +128,11 @@ class FallbackLLMProvider(LLMProvider):
             except Exception as fallback_exc:
                 self._log_fallback_failed(fallback_exc)
                 raise
-            logger.info("LLM fallback provider succeeded provider=%s", type(self._fallback).__name__)
+            self._use_fallback = True
+            logger.info(
+                "LLM fallback provider succeeded provider=%s -- sticky for the rest of this job",
+                type(self._fallback).__name__,
+            )
             return result
 
     def _log_fallback_triggered(self, exc: Exception) -> None:
