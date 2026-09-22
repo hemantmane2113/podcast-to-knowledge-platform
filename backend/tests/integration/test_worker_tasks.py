@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import pytest
@@ -437,6 +438,35 @@ async def test_generate_article_fails_clearly_when_lazy_construction_raises(
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
     assert refreshed_episode.status == ProcessingStatus.FAILED
     assert "not configured" in refreshed_episode.last_error
+    assert refreshed_job.status == JobStatus.FAILED
+
+
+async def test_generate_article_marks_failed_on_cancellation_instead_of_leaving_it_stuck(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for a real stuck job: arq's own job_timeout (default
+    300s) cancels a job that runs too long by raising asyncio.CancelledError
+    at the current await point inside run_article_pipeline --
+    CancelledError is a BaseException, not an Exception, so it was never
+    caught by generate_article's `except Exception`. That left
+    ProcessingJob/Episode permanently stuck at RUNNING/ANALYZING even
+    though the worker process itself was fine and had already moved on --
+    with no way to recover, since a later POST /generate-article just kept
+    returning that same permanently "active" job
+    (ArticleService.request_generation). Simulates the exact cancellation
+    directly rather than waiting a real 300s."""
+    episode, transcript, job = await _seed_episode_with_chunks(db_session)
+
+    async def _cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.worker.tasks.run_article_pipeline", _cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
+
+    refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
+    assert refreshed_episode.status == ProcessingStatus.FAILED
     assert refreshed_job.status == JobStatus.FAILED
 
 

@@ -7,6 +7,7 @@ ingest_episode_transcript) rather than needing its own API trigger, since
 Phase 3A has exactly one thing to do after a transcript exists.
 """
 
+import asyncio
 import logging
 import uuid
 
@@ -253,6 +254,36 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                 "max_revision_attempts": settings.max_revision_attempts,
             }
             final_state = await run_article_pipeline(deps, initial_state)
+        except asyncio.CancelledError:
+            # arq's own job_timeout (WorkerSettings, default 300s) cancels
+            # a job that runs too long by injecting CancelledError at the
+            # current await point -- a BaseException, not an Exception, so
+            # it was never caught by `except Exception` below. That left
+            # ProcessingJob/Episode stuck at RUNNING/ANALYZING forever even
+            # when the worker process itself was fine and had already
+            # moved on to other jobs: arq's cancellation only updates its
+            # own Redis-side job bookkeeping, never our processing_jobs
+            # table, since our own except block simply never ran. Found
+            # via a real stuck job with no code path left to recover it
+            # (a later POST just kept returning the same permanently
+            # "active" job -- see ArticleService.request_generation).
+            #
+            # Always mark this attempt failed here, unconditionally: if
+            # arq's own retry policy invokes this task again, the next
+            # invocation's mark_running() above immediately overwrites
+            # this with RUNNING again (harmless); if this was the final
+            # attempt, FAILED is the correct terminal state instead of a
+            # permanent, unrecoverable ANALYZING/RUNNING. Never swallow
+            # the cancellation itself -- re-raise so arq observes it as it
+            # expects.
+            await session.rollback()
+            logger.error(
+                "Article generation cancelled (job timeout) for episode %s (job try %s)",
+                episode_id,
+                ctx.get("job_try"),
+            )
+            await _mark_failed(session, episode_uuid, job_uuid, _GENERIC_ARTICLE_FAILURE_MESSAGE)
+            raise
         except Exception as exc:
             await session.rollback()
 
