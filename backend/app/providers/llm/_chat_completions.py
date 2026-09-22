@@ -17,6 +17,17 @@ from app.providers.llm.base import LLMMessage, LLMProvider, LLMTextResponse, LLM
 
 T = TypeVar("T", bound=BaseModel)
 
+# SDK-level retries are disabled (max_retries=0) and the per-request
+# timeout is kept well under arq's job timeout (default 300s, unchanged --
+# see app/worker/settings.py): a 429's Retry-After header can itself be
+# 100s+, and the SDK default of 2 retries compounds that, which previously
+# consumed the entire job timeout before our own error handling (now
+# FallbackLLMProvider) ever got a chance to run. A single failed attempt
+# maps to a retryable provider error below and is handled by switching
+# providers, not by waiting inside the SDK.
+DEFAULT_CLIENT_TIMEOUT_SECONDS = 60.0
+DEFAULT_CLIENT_MAX_RETRIES = 0
+
 
 class ChatCompletionsClient(Protocol):
     """Structural type for the subset of the OpenAI/Groq client shape this
@@ -63,6 +74,8 @@ def map_sdk_exception(
         LLMProviderAuthError,
         LLMProviderError,
         LLMProviderRateLimitError,
+        LLMProviderRequestError,
+        LLMProviderTransientError,
     )
 
     if isinstance(exc, auth_error_type):
@@ -70,13 +83,18 @@ def map_sdk_exception(
     if isinstance(exc, rate_limit_error_type):
         return LLMProviderRateLimitError(str(exc))
     if isinstance(exc, connection_error_type):
-        return LLMProviderError(str(exc))  # transient, retryable by default
+        return LLMProviderTransientError(str(exc))  # network/timeout, retryable
+
     status_code = getattr(exc, "status_code", None)
     if status_code == 401:
         return LLMProviderAuthError(str(exc))
     if status_code == 429:
         return LLMProviderRateLimitError(str(exc))
-    return LLMProviderError(str(exc))
+    if status_code == 400:
+        return LLMProviderRequestError(str(exc))  # malformed request, not retryable
+    if status_code is not None and 500 <= status_code < 600:
+        return LLMProviderTransientError(str(exc))  # server error, retryable
+    return LLMProviderError(str(exc))  # unknown -- retryable by default (existing behavior)
 
 
 _STRUCTURED_OUTPUT_INSTRUCTION = (

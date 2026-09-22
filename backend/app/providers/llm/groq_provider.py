@@ -9,7 +9,12 @@ from groq import AuthenticationError as GroqAuthenticationError
 from groq import RateLimitError as GroqRateLimitError
 
 from app.core.exceptions import LLMProviderAuthError
-from app.providers.llm._chat_completions import ChatCompletionsProvider, map_sdk_exception
+from app.providers.llm._chat_completions import (
+    DEFAULT_CLIENT_MAX_RETRIES,
+    DEFAULT_CLIENT_TIMEOUT_SECONDS,
+    ChatCompletionsProvider,
+    map_sdk_exception,
+)
 
 
 class GroqProvider(ChatCompletionsProvider):
@@ -19,7 +24,11 @@ class GroqProvider(ChatCompletionsProvider):
         if not model:
             raise LLMProviderAuthError("LLM_MODEL is not configured")
         self._model = model
-        self._client = AsyncGroq(api_key=api_key)
+        self._client = AsyncGroq(
+            api_key=api_key,
+            timeout=DEFAULT_CLIENT_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_CLIENT_MAX_RETRIES,
+        )
 
     def _map_exception(self, exc: Exception) -> Exception:
         return map_sdk_exception(

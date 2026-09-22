@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     opensource_base_url: str = ""
     opensource_api_key: str = ""
+    # When the primary provider isn't already "openai" itself, wraps it in
+    # FallbackLLMProvider (app/providers/llm/fallback_provider.py): a
+    # retryable primary failure (rate limit, 5xx, connection/timeout)
+    # retries once against OpenAI instead of failing the job. See
+    # app/providers/llm/factory.py.
+    openai_fallback_enabled: bool = True
+    openai_fallback_model: str = "gpt-5.4"
     # Off by default: an LLM-based validation check is a supplementary
     # signal, never a replacement for the deterministic checks in
     # app/services/article_validation.py, and shouldn't add a paid call to

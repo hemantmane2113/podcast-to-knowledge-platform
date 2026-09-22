@@ -131,6 +131,26 @@ class LLMProviderRateLimitError(LLMProviderError):
     retryable = True
 
 
+class LLMProviderTransientError(LLMProviderError):
+    """A server-side (5xx) or connection/timeout failure -- distinct from
+    the rate-limit and generic-unknown cases mainly so logging/metrics can
+    tell them apart; behaves identically to the LLMProviderError default
+    otherwise (retryable)."""
+
+    code = "LLM_PROVIDER_TRANSIENT_ERROR"
+    retryable = True
+
+
+class LLMProviderRequestError(LLMProviderError):
+    """The request itself was malformed (HTTP 400) -- an application-side
+    bug (bad params, invalid schema, ...), not a provider outage. Never
+    retried: retrying the same bad request against a different provider
+    wouldn't fix it either, and would hide the real bug."""
+
+    code = "LLM_PROVIDER_REQUEST_ERROR"
+    retryable = False
+
+
 class LLMStructuredOutputError(LLMProviderError):
     """The model's response couldn't be parsed/validated against the
     requested structured-output schema, even after one retry. Never

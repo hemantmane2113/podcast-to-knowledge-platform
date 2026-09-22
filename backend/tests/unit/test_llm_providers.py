@@ -24,11 +24,18 @@ from app.core.exceptions import (
     LLMProviderAuthError,
     LLMProviderError,
     LLMProviderRateLimitError,
+    LLMProviderRequestError,
+    LLMProviderTransientError,
     LLMStructuredOutputError,
 )
-from app.providers.llm._chat_completions import ChatCompletionsProvider
+from app.providers.llm._chat_completions import (
+    DEFAULT_CLIENT_MAX_RETRIES,
+    DEFAULT_CLIENT_TIMEOUT_SECONDS,
+    ChatCompletionsProvider,
+)
 from app.providers.llm.base import LLMMessage
 from app.providers.llm.factory import get_llm_provider
+from app.providers.llm.fallback_provider import FallbackLLMProvider
 from app.providers.llm.groq_provider import GroqProvider
 from app.providers.llm.openai_provider import OpenAIProvider
 from app.providers.llm.opensource_provider import OpenSourceProvider
@@ -64,7 +71,14 @@ class _StubChatCompletionsProvider(ChatCompletionsProvider):
 
 
 def test_factory_selects_groq_by_default() -> None:
-    settings = Settings(_env_file=None, app_env="development", llm_provider="groq", groq_api_key="k", llm_model="m")
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="groq",
+        groq_api_key="k",
+        llm_model="m",
+        openai_fallback_enabled=False,
+    )
     assert isinstance(get_llm_provider(settings), GroqProvider)
 
 
@@ -80,6 +94,7 @@ def test_factory_selects_opensource() -> None:
         llm_provider="opensource",
         opensource_base_url="http://localhost:8080/v1",
         llm_model="m",
+        openai_fallback_enabled=False,
     )
     assert isinstance(get_llm_provider(settings), OpenSourceProvider)
 
@@ -88,6 +103,72 @@ def test_factory_raises_for_unknown_provider() -> None:
     settings = Settings(_env_file=None, app_env="development", llm_provider="groq", groq_api_key="k", llm_model="m")
     object.__setattr__(settings, "llm_provider", "not-a-provider")
     with pytest.raises(ValueError, match="not-a-provider"):
+        get_llm_provider(settings)
+
+
+# --- factory: fallback wrapping -----------------------------------------------------
+
+
+def test_factory_wraps_groq_with_openai_fallback_when_enabled() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="groq",
+        groq_api_key="k",
+        llm_model="m",
+        openai_fallback_enabled=True,
+        openai_api_key="ok",
+        openai_fallback_model="gpt-5.4",
+    )
+    provider = get_llm_provider(settings)
+    assert isinstance(provider, FallbackLLMProvider)
+    assert isinstance(provider._primary, GroqProvider)
+    assert isinstance(provider._fallback, OpenAIProvider)
+
+
+def test_factory_returns_bare_primary_when_fallback_disabled() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="groq",
+        groq_api_key="k",
+        llm_model="m",
+        openai_fallback_enabled=False,
+    )
+    provider = get_llm_provider(settings)
+    assert isinstance(provider, GroqProvider)
+    assert not isinstance(provider, FallbackLLMProvider)
+
+
+def test_factory_does_not_wrap_openai_primary_with_an_openai_fallback() -> None:
+    """Primary == openai must never become FallbackLLMProvider(openai, openai)
+    -- that would just retry the same provider against itself."""
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="openai",
+        openai_api_key="k",
+        llm_model="m",
+        openai_fallback_enabled=True,
+    )
+    provider = get_llm_provider(settings)
+    assert isinstance(provider, OpenAIProvider)
+    assert not isinstance(provider, FallbackLLMProvider)
+
+
+def test_factory_raises_when_fallback_enabled_but_openai_key_missing() -> None:
+    """Fails clearly at construction time, same pattern as a missing
+    primary key -- no silent "fallback quietly unavailable" state."""
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="groq",
+        groq_api_key="k",
+        llm_model="m",
+        openai_fallback_enabled=True,
+        openai_api_key="",
+    )
+    with pytest.raises(LLMProviderAuthError, match="OPENAI_API_KEY"):
         get_llm_provider(settings)
 
 
@@ -262,7 +343,11 @@ async def test_groq_provider_generate_end_to_end_through_real_client_constructio
         mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from groq"))
 
         provider = GroqProvider(api_key="real-key", model="llama-3.3-70b-versatile")
-        mock_client_cls.assert_called_once_with(api_key="real-key")
+        mock_client_cls.assert_called_once_with(
+            api_key="real-key",
+            timeout=DEFAULT_CLIENT_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_CLIENT_MAX_RETRIES,
+        )
 
         response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
 
@@ -284,18 +369,35 @@ def test_groq_provider_maps_rate_limit_error() -> None:
     assert isinstance(provider._map_exception(exc), LLMProviderRateLimitError)
 
 
-def test_groq_provider_maps_connection_error_to_retryable_generic() -> None:
+def test_groq_provider_maps_connection_error_to_retryable_transient() -> None:
     provider = GroqProvider(api_key="k", model="m")
     exc = groq.APIConnectionError(request=_httpx_request())
     mapped = provider._map_exception(exc)
-    assert type(mapped) is LLMProviderError
+    assert type(mapped) is LLMProviderTransientError
     assert mapped.retryable is True
+
+
+def test_groq_provider_maps_server_error_to_retryable_transient() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    exc = groq.InternalServerError("oops", response=_httpx_response(500), body=None)
+    mapped = provider._map_exception(exc)
+    assert type(mapped) is LLMProviderTransientError
+    assert mapped.retryable is True
+
+
+def test_groq_provider_maps_bad_request_to_non_retryable_request_error() -> None:
+    provider = GroqProvider(api_key="k", model="m")
+    exc = groq.BadRequestError("malformed", response=_httpx_response(400), body=None)
+    mapped = provider._map_exception(exc)
+    assert type(mapped) is LLMProviderRequestError
+    assert mapped.retryable is False
 
 
 def test_groq_provider_maps_unknown_exception_to_generic_provider_error() -> None:
     provider = GroqProvider(api_key="k", model="m")
     mapped = provider._map_exception(ValueError("something else"))
     assert type(mapped) is LLMProviderError
+    assert mapped.retryable is True
 
 
 async def test_openai_provider_generate_end_to_end_through_real_client_construction() -> None:
@@ -304,7 +406,11 @@ async def test_openai_provider_generate_end_to_end_through_real_client_construct
         mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from openai"))
 
         provider = OpenAIProvider(api_key="real-key", model="gpt-4o-mini")
-        mock_client_cls.assert_called_once_with(api_key="real-key")
+        mock_client_cls.assert_called_once_with(
+            api_key="real-key",
+            timeout=DEFAULT_CLIENT_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_CLIENT_MAX_RETRIES,
+        )
 
         response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
 
@@ -330,7 +436,12 @@ async def test_opensource_provider_generate_end_to_end_uses_configured_base_url(
         mock_client.chat.completions.create = AsyncMock(return_value=_fake_completion("hello from vllm"))
 
         provider = OpenSourceProvider(base_url="http://localhost:8080/v1", model="local-model")
-        mock_client_cls.assert_called_once_with(base_url="http://localhost:8080/v1", api_key="not-required")
+        mock_client_cls.assert_called_once_with(
+            base_url="http://localhost:8080/v1",
+            api_key="not-required",
+            timeout=DEFAULT_CLIENT_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_CLIENT_MAX_RETRIES,
+        )
 
         response = await provider.generate(messages=[LLMMessage(role="user", content="hi")])
 
@@ -340,7 +451,12 @@ async def test_opensource_provider_generate_end_to_end_uses_configured_base_url(
 def test_opensource_provider_passes_through_a_real_api_key_when_given() -> None:
     with patch("app.providers.llm.opensource_provider.AsyncOpenAI") as mock_client_cls:
         OpenSourceProvider(base_url="http://localhost:8080/v1", model="m", api_key="secret")
-        mock_client_cls.assert_called_once_with(base_url="http://localhost:8080/v1", api_key="secret")
+        mock_client_cls.assert_called_once_with(
+            base_url="http://localhost:8080/v1",
+            api_key="secret",
+            timeout=DEFAULT_CLIENT_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_CLIENT_MAX_RETRIES,
+        )
 
 
 def test_opensource_provider_maps_authentication_error() -> None:
