@@ -6,10 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_article_service
 from app.main import app
 from app.models.episode import Episode, ProcessingStatus
+from app.models.processing_job import JobStatus, JobType
 from app.models.transcript import Transcript
 from app.repositories.article_plan_repository import ArticlePlanRepository
 from app.repositories.article_repository import ArticleRepository, ArticleSectionCandidate
 from app.repositories.chunk_repository import ChunkRepository
+from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.repositories.validation_result_repository import ValidationResultRepository
 from app.services.article_service import ArticleService
 from app.services.chunking_service import ChunkCandidate
@@ -70,6 +72,108 @@ async def test_generate_article_enqueues_job_and_returns_202(db_session: AsyncSe
     assert uuid.UUID(body["job_id"])
     assert len(queue.enqueued_article_generation) == 1
     assert queue.enqueued_article_generation[0][0] == episode.id
+
+
+# --- request_generation job lifecycle: active / failed / completed -----------------
+
+
+async def test_generate_article_returns_existing_active_job_instead_of_duplicating(
+    db_session: AsyncSession,
+) -> None:
+    episode, _ = await _seed_episode_and_transcript(db_session)
+    existing_job = ProcessingJobRepository(db_session).create(
+        episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION
+    )
+    await db_session.commit()
+    assert existing_job.status == JobStatus.PENDING
+
+    queue = FakeJobQueue()
+    client = await _client(db_session, queue)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/generate-article")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == str(existing_job.id)
+    assert len(queue.enqueued_article_generation) == 0  # no duplicate job enqueued
+
+
+async def test_generate_article_allows_a_fresh_attempt_after_a_failed_job(
+    db_session: AsyncSession,
+) -> None:
+    episode, _ = await _seed_episode_and_transcript(db_session)
+    jobs = ProcessingJobRepository(db_session)
+    failed_job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await db_session.commit()
+    jobs.mark_failed(failed_job, "LLM provider is not configured (check LLM_PROVIDER and its API key).")
+    await db_session.commit()
+
+    queue = FakeJobQueue()
+    client = await _client(db_session, queue)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/generate-article")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 202
+    new_job_id = uuid.UUID(response.json()["job_id"])
+    assert new_job_id != failed_job.id  # a genuinely new job, not the failed one
+    assert len(queue.enqueued_article_generation) == 1
+    assert queue.enqueued_article_generation[0] == (episode.id, new_job_id)
+
+
+async def _seed_completed_article(session: AsyncSession, episode: Episode, transcript: Transcript) -> None:
+    await ChunkRepository(session).replace_all(
+        transcript_id=transcript.id,
+        episode_id=episode.id,
+        candidates=[
+            ChunkCandidate(
+                sequence_number=0,
+                text="Some source text.",
+                start_ms=0,
+                end_ms=1_000,
+                source_segment_ids=[],
+                token_count=5,
+            )
+        ],
+    )
+    await session.commit()
+    plan = await ArticlePlanRepository(session).replace(
+        episode_id=episode.id, title="p", introduction_summary="i", conclusion_summary="c", sections=[]
+    )
+    await session.commit()
+    await ArticleRepository(session).replace(
+        episode_id=episode.id, article_plan_id=plan.id, title="The Article", revision_count=0, sections=[]
+    )
+    await session.commit()
+
+
+async def test_generate_article_does_not_regenerate_when_an_article_already_exists(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_completed_article(db_session, episode, transcript)
+
+    jobs = ProcessingJobRepository(db_session)
+    completed_job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
+    await db_session.commit()
+    jobs.mark_completed(completed_job)
+    await db_session.commit()
+
+    queue = FakeJobQueue()
+    client = await _client(db_session, queue)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/generate-article")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == str(completed_job.id)
+    assert len(queue.enqueued_article_generation) == 0  # not silently regenerated
 
 
 async def test_get_article_unknown_episode_returns_404(db_session: AsyncSession) -> None:

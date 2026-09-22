@@ -26,6 +26,17 @@ class ProcessingJobRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_latest_job(
+        self, episode_id: uuid.UUID, job_type: JobType
+    ) -> ProcessingJob | None:
+        result = await self._session.execute(
+            select(ProcessingJob)
+            .where(ProcessingJob.episode_id == episode_id, ProcessingJob.job_type == job_type)
+            .order_by(ProcessingJob.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     def create(self, episode_id: uuid.UUID, job_type: JobType) -> ProcessingJob:
         job = ProcessingJob(
             id=uuid.uuid4(),
