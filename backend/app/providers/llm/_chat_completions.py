@@ -126,6 +126,47 @@ _STRUCTURED_OUTPUT_INSTRUCTION = (
     "the JSON:\n\n{schema}"
 )
 
+# Groq's `response_format={"type": "json_object"}` performs its own
+# server-side check that the model's generation is syntactically valid
+# JSON, and rejects the request with HTTP 400 + `error.code ==
+# "json_validate_failed"` if the model failed to produce it -- this is a
+# *model-generation* failure (the same class of problem `generate_structured`
+# already retries locally via `_STRUCTURED_OUTPUT_INSTRUCTION`'s corrective
+# feedback loop when our own `response_model.model_validate_json(raw_text)`
+# fails below), not a malformed *request* from us. Found via a real run:
+# it was falling into the generic `status_code == 400 ->
+# LLMProviderRequestError` branch of map_sdk_exception (correct for an
+# actually-malformed request, e.g. bad params) before any text was ever
+# returned to retry against -- short-circuiting the local corrective-retry
+# loop entirely and, since LLMProviderRequestError.retryable is False,
+# also skipping FallbackLLMProvider's provider fallback. Deliberately
+# scoped to this one Groq error code: every other 400 (including a
+# genuinely malformed request) is unaffected, and this never triggers
+# provider fallback -- only the existing local retry.
+_MODEL_JSON_VALIDATION_ERROR_CODE = "json_validate_failed"
+
+
+def _is_model_json_validation_failure(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return False
+    return error.get("code") == _MODEL_JSON_VALIDATION_ERROR_CODE
+
+
+def _describe_model_json_validation_failure(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return str(exc)
+
 
 class ChatCompletionsProvider(LLMProvider):
     """Base for any LLMProvider backed by an OpenAI-style chat-completions
@@ -194,7 +235,26 @@ class ChatCompletionsProvider(LLMProvider):
                     )
                 )
             except Exception as exc:
-                raise self._map_exception(exc) from exc
+                if not _is_model_json_validation_failure(exc):
+                    raise self._map_exception(exc) from exc
+                # The provider rejected the request before returning any
+                # content (see _is_model_json_validation_failure above) --
+                # there's no raw_text to include as a prior "assistant"
+                # turn, unlike the local-validation-failure branch below.
+                last_error = exc
+                payload_messages = [
+                    *payload_messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response failed JSON validation: "
+                            f"{_describe_model_json_validation_failure(exc)}. Respond again with ONLY "
+                            "a single valid JSON object matching the schema given above -- no prose, "
+                            "no markdown code fences, and ensure every string is properly JSON-escaped."
+                        ),
+                    },
+                ]
+                continue
 
             raw_text, _ = _extract_text_and_usage(response)
             try:

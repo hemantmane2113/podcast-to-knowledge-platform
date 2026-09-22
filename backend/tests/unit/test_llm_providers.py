@@ -32,6 +32,7 @@ from app.providers.llm._chat_completions import (
     DEFAULT_CLIENT_MAX_RETRIES,
     DEFAULT_CLIENT_TIMEOUT_SECONDS,
     ChatCompletionsProvider,
+    _is_model_json_validation_failure,
 )
 from app.providers.llm.base import LLMMessage
 from app.providers.llm.factory import get_llm_provider
@@ -372,6 +373,138 @@ async def test_generate_structured_includes_json_schema_in_system_prompt() -> No
     assert "Be helpful." in sent_messages[0]["content"]
     assert "\"title\"" in sent_messages[0]["content"]  # schema property present
     assert create.call_args_list[0].kwargs["response_format"] == {"type": "json_object"}
+
+
+# --- generate_structured(): Groq's own `json_validate_failed` structured------------
+# --- output failure is a model-generation problem, not a malformed request ---------
+# (see app/providers/llm/_chat_completions.py's _is_model_json_validation_failure
+# docstring/comment) -- it must enter the SAME local corrective-retry loop as a
+# response that fails our own Pydantic validation, not be raised immediately as a
+# non-retryable LLMProviderRequestError the way a genuinely malformed 400 is.
+
+
+def _groq_json_validate_failed_error(message: str = "Failed to validate JSON.") -> "groq.BadRequestError":
+    # Mirrors the real Groq error body shape (groq.types.shared.error_object
+    # .ErrorObject): {"error": {"message": ..., "type": ..., "code":
+    # "json_validate_failed", "failed_generation": ...}}.
+    return groq.BadRequestError(
+        message,
+        response=_httpx_response(400),
+        body={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "json_validate_failed",
+                "failed_generation": "",
+            }
+        },
+    )
+
+
+def test_groq_json_validate_failed_is_recognized_as_model_generation_failure() -> None:
+    # (A) The specific Groq structured-output validation failure is
+    # distinguished from a generic malformed-request 400.
+    exc = _groq_json_validate_failed_error("Failed to validate JSON. Please adjust your prompt.")
+    assert _is_model_json_validation_failure(exc) is True
+
+
+def test_generic_bad_request_is_not_a_model_json_validation_failure() -> None:
+    # A 400 with no body, or a body/code that isn't json_validate_failed,
+    # must never be misclassified as this specific failure.
+    assert _is_model_json_validation_failure(groq.BadRequestError("bad", response=_httpx_response(400), body=None)) is False
+    other_code = groq.BadRequestError(
+        "bad model",
+        response=_httpx_response(400),
+        body={"error": {"message": "bad model", "type": "invalid_request_error", "code": "model_not_found"}},
+    )
+    assert _is_model_json_validation_failure(other_code) is False
+
+
+async def test_generate_structured_enters_corrective_retry_on_groq_json_validate_failed() -> None:
+    # (B) The failure must not propagate immediately -- it enters the same
+    # local retry loop as an invalid-JSON response, with a corrective
+    # follow-up message appended (mirroring the "not valid JSON" retry
+    # path already tested above).
+    create = AsyncMock(
+        side_effect=[_groq_json_validate_failed_error(), _fake_completion(json.dumps({"title": "fixed", "count": 1}))]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+    )
+
+    assert create.call_count == 2
+    second_call_messages = create.call_args_list[1].kwargs["messages"]
+    assert any("JSON validation" in m["content"] for m in second_call_messages)
+    # (C) The subsequent valid response succeeds normally.
+    assert result == _Example(title="fixed", count=1)
+
+
+async def test_generate_structured_exhausts_retry_and_raises_structured_output_error_when_still_failing() -> None:
+    # "if the retry still fails -> preserve the existing failure behavior":
+    # two consecutive json_validate_failed responses must end in the same
+    # LLMStructuredOutputError that two consecutive invalid-JSON responses
+    # already end in (test_generate_structured_raises_after_two_failed_attempts).
+    create = AsyncMock(side_effect=[_groq_json_validate_failed_error(), _groq_json_validate_failed_error()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    with pytest.raises(LLMStructuredOutputError):
+        await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+    assert create.call_count == 2
+
+
+async def test_generate_structured_still_raises_immediately_for_a_genuine_malformed_request() -> None:
+    # (D) A normal HTTP 400 (no json_validate_failed code) must remain
+    # non-retryable: no local retry, mapped straight through
+    # _map_exception exactly as before this fix.
+    create = AsyncMock(side_effect=groq.BadRequestError("malformed", response=_httpx_response(400), body=None))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    class _Provider(_StubChatCompletionsProvider):
+        def _map_exception(self, exc: Exception) -> Exception:
+            return LLMProviderRequestError(str(exc))
+
+    provider = _Provider(client)
+
+    with pytest.raises(LLMProviderRequestError):
+        await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+    assert create.call_count == 1
+
+
+async def test_generate_structured_fallback_to_openai_still_works_for_a_genuine_rate_limit() -> None:
+    # (E) Existing fallback behavior for a genuinely retryable primary
+    # failure (429) is unaffected by this fix -- the new check only ever
+    # looks at HTTP 400 responses, so a 429 takes the exact same path as
+    # before through map_sdk_exception -> LLMProviderRateLimitError ->
+    # FallbackLLMProvider.
+    with (
+        patch("app.providers.llm.groq_provider.AsyncGroq") as mock_groq_cls,
+        patch("app.providers.llm.openai_provider.AsyncOpenAI") as mock_openai_cls,
+    ):
+        mock_groq_cls.return_value.chat.completions.create = AsyncMock(
+            side_effect=groq.RateLimitError("slow down", response=_httpx_response(429), body=None)
+        )
+        mock_openai_cls.return_value.chat.completions.create = AsyncMock(
+            return_value=_fake_completion(json.dumps({"title": "from openai", "count": 1}))
+        )
+
+        groq_provider = GroqProvider(api_key="k", model="m")
+        openai_provider = OpenAIProvider(api_key="k", model="m")
+        provider = FallbackLLMProvider(primary=groq_provider, fallback=openai_provider)
+
+        result = await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="give me json")], response_model=_Example
+        )
+
+    assert result == _Example(title="from openai", count=1)
+    mock_openai_cls.return_value.chat.completions.create.assert_awaited_once()
 
 
 # --- concrete providers: client construction, end-to-end generate(), and -----------
