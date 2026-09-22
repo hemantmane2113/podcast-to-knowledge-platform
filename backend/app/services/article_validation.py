@@ -240,7 +240,28 @@ def check_invalid_source_references(
     )
 
 
-# --- 10. Broken transcript timestamp references -------------------------------------------
+# --- 10. Section count sanity (pathological counts only, not the target range) ----------
+
+
+def check_section_count(sections: list[ArticleSection], min_sections: int, max_sections: int) -> CheckResult:
+    """`min_sections`/`max_sections` (Settings.section_count_min/max) are a
+    pathology bound, not the planner's target range
+    (Settings.section_count_target_min/max, used only as prompt guidance
+    in app/ai/prompts.py::planning_prompt) -- deliberately much wider, so
+    a genuinely well-structured article that happens to land outside the
+    *typical* target (e.g. 5 or 11 sections) never fails this check.
+    """
+    count = len(sections)
+    passed = min_sections <= count <= max_sections
+    details = (
+        f"Article has {count} section(s)."
+        if passed
+        else f"Article has {count} section(s), outside the expected {min_sections}-{max_sections} range."
+    )
+    return CheckResult("section_count", passed, details)
+
+
+# --- 11. Broken transcript timestamp references -------------------------------------------
 
 
 def check_broken_timestamp_references(
@@ -270,6 +291,8 @@ def run_validation(
     topics: list[Topic],
     transcript_word_count: int,
     max_length_ratio: float,
+    min_sections: int,
+    max_sections: int,
 ) -> ValidationReport:
     valid_chunk_ids = {c.id for c in chunks}
     valid_topic_ids = {t.id for t in topics}
@@ -285,6 +308,7 @@ def run_validation(
         check_article_length(sections, transcript_word_count, max_length_ratio),
         check_unsupported_content(sections),
         check_invalid_source_references(sections, plan, valid_topic_ids),
+        check_section_count(sections, min_sections, max_sections),
         check_broken_timestamp_references(sections, chunks_by_id),
     ]
     return ValidationReport(checks=checks)

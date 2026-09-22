@@ -317,16 +317,29 @@ async def _seed_episode_with_chunks(session: AsyncSession):
 def _fake_llm_provider() -> FakeLLMProvider:
     from app.ai.schemas import ArticlePlanResult, GeneratedSection, PlannedSection, TopicAnalysisResult, TopicItem
 
+    # Three sections, not one: Settings.section_count_min defaults to 3
+    # (app/services/article_validation.py::check_section_count), and a
+    # real worker process reads real settings (get_settings(), not
+    # overridable per-test here) -- a single-section plan would trigger
+    # an extra, unprogrammed revision round in these tests. Distinct
+    # content per section (not just heading) so check_no_duplicate_sections
+    # doesn't ALSO fail and force yet another revision round.
     return FakeLLMProvider(
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0])]),
             ArticlePlanResult(
                 title="The Article",
                 introduction_summary="i",
-                sections=[PlannedSection(heading="Intro", supporting_topic_sequence_numbers=[0])],
+                sections=[
+                    PlannedSection(heading="Intro", supporting_topic_sequence_numbers=[0]),
+                    PlannedSection(heading="Body", supporting_topic_sequence_numbers=[0]),
+                    PlannedSection(heading="Conclusion", supporting_topic_sequence_numbers=[0]),
+                ],
                 conclusion_summary="c",
             ),
-            GeneratedSection(heading="Intro", content=" ".join(["word"] * 150)),
+            GeneratedSection(heading="Intro", content=" ".join(["intro"] + ["word"] * 149)),
+            GeneratedSection(heading="Body", content=" ".join(["body"] + ["word"] * 149)),
+            GeneratedSection(heading="Conclusion", content=" ".join(["conclusion"] + ["word"] * 149)),
         ]
     )
 
@@ -346,7 +359,7 @@ async def test_generate_article_success_persists_article_and_marks_ready_for_rev
     article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
     assert article is not None
     assert article.title == "The Article"
-    assert len(article.sections) == 1
+    assert len(article.sections) == 3
 
 
 async def test_generate_article_missing_llm_provider_fails_without_raising(

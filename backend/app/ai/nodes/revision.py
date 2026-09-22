@@ -13,7 +13,7 @@ same prompt/fidelity constraints.
 
 import re
 
-from app.ai.nodes.section_generation import generate_section
+from app.ai.nodes.section_generation import generate_section, section_headings_by_sequence
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.episode import ProcessingStatus
 from app.repositories.article_repository import ArticleSectionCandidate
@@ -51,6 +51,8 @@ def build(deps: PipelineDeps):
 
         plan = state["plan"]
         chunk_by_id = {c.id: c for c in state["chunks"]}
+        topic_by_id = {t.id: t for t in state["topics"]}
+        section_headings = section_headings_by_sequence(plan.sections)
         current_sections_by_sequence = {s.sequence_number: s for s in state["article"].sections}
 
         # No specific section identified anywhere -> regenerate everything
@@ -69,7 +71,13 @@ def build(deps: PipelineDeps):
                     feedback_parts.extend(section_specific)
                 candidates.append(
                     await generate_section(
-                        deps, planned_section, chunk_by_id, revision_feedback="; ".join(feedback_parts) or None
+                        deps,
+                        planned_section,
+                        chunk_by_id,
+                        topic_by_id,
+                        article_title=plan.title,
+                        section_headings=section_headings,
+                        revision_feedback="; ".join(feedback_parts) or None,
                     )
                 )
             else:

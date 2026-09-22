@@ -10,14 +10,17 @@ import uuid
 from types import SimpleNamespace
 
 from app.ai.nodes.revision import _sections_needing_revision
+from app.ai.nodes.section_generation import generate_section, section_headings_by_sequence
 from app.ai.nodes.topic_analysis import (
     _batch_chunks,
     _boundary_candidate_indices,
     _merge_topics,
     _reconstruct_topics,
 )
-from app.ai.schemas import TopicClaim, TopicItem, TopicMergeDecision, TopicMergeGroup
+from app.ai.prompts import section_generation_prompt
+from app.ai.schemas import GeneratedSection, TopicClaim, TopicItem, TopicMergeDecision, TopicMergeGroup
 from app.models.chunk import Chunk
+from app.models.topic import Topic
 from tests.fakes import FakeLLMProvider
 
 
@@ -488,3 +491,217 @@ def test_dedup_claims_and_subtopics_removes_only_exact_duplicates() -> None:
 
     subtopics = ["a", "b", "a"]
     assert _dedup_strings(subtopics) == ["a", "b"]
+
+
+# --- section generation: topic knowledge + article outline (app/ai/nodes/section_generation.py,
+# --- app/ai/prompts.py::section_generation_prompt) -----------------------------------------
+
+
+def _topic_row(
+    title: str,
+    summary: str,
+    *,
+    claims: list[dict] | None = None,
+    subtopics: list[str] | None = None,
+) -> Topic:
+    return Topic(
+        id=uuid.uuid4(),
+        transcript_id=uuid.uuid4(),
+        episode_id=uuid.uuid4(),
+        sequence_number=0,
+        title=title,
+        summary=summary,
+        chunk_ids=[],
+        key_claims=claims or [],
+        subtopics=subtopics or [],
+    )
+
+
+def _planned_section(
+    *,
+    sequence_number: int,
+    heading: str,
+    supporting_chunk_ids: list[uuid.UUID],
+    supporting_topic_ids: list[uuid.UUID],
+) -> dict:
+    return {
+        "sequence_number": sequence_number,
+        "heading": heading,
+        "key_ideas": [],
+        "supporting_chunk_ids": [str(cid) for cid in supporting_chunk_ids],
+        "supporting_topic_ids": [str(tid) for tid in supporting_topic_ids],
+        "viewpoints": [],
+        "attribution_notes": [],
+    }
+
+
+def test_section_headings_by_sequence_orders_by_sequence_number_not_storage_order() -> None:
+    sections = [
+        {"sequence_number": 2, "heading": "Conclusion"},
+        {"sequence_number": 0, "heading": "Intro"},
+        {"sequence_number": 1, "heading": "Middle"},
+    ]
+    assert section_headings_by_sequence(sections) == ["Intro", "Middle", "Conclusion"]
+
+
+async def test_generate_section_includes_relevant_topic_knowledge_but_excludes_irrelevant_topics() -> None:
+    relevant = _topic_row(
+        "Relevant Topic",
+        "relevant summary",
+        claims=[{"text": "relevant claim text", "speaker": "Alice", "claim_type": "fact"}],
+        subtopics=["relevant subtopic"],
+    )
+    irrelevant = _topic_row(
+        "Irrelevant Topic",
+        "irrelevant summary",
+        claims=[{"text": "irrelevant claim text", "speaker": "Bob", "claim_type": "opinion"}],
+        subtopics=["irrelevant subtopic"],
+    )
+    chunk = _chunk("this section's own raw transcript excerpt", 0)
+    chunk_by_id = {chunk.id: chunk}
+    topic_by_id = {relevant.id: relevant, irrelevant.id: irrelevant}
+    planned_section = _planned_section(
+        sequence_number=0,
+        heading="Section A",
+        supporting_chunk_ids=[chunk.id],
+        supporting_topic_ids=[relevant.id],  # only the relevant topic is referenced
+    )
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[GeneratedSection(heading="Section A", content="generated prose")]
+        )
+    )
+
+    result = await generate_section(
+        deps, planned_section, chunk_by_id, topic_by_id,
+        article_title="The Article", section_headings=["Section A"],
+    )
+
+    messages, system, response_model = deps.llm_provider.structured_calls[0]
+    prompt_text = system + messages[0].content
+
+    # A1. Relevant topic knowledge reaches the prompt.
+    assert "Relevant Topic" in prompt_text
+    assert "relevant summary" in prompt_text
+    # A3. Relevant claims preserve text/speaker/claim_type -- checked as
+    # one exact formatted line (not a bare "fact"/"Alice" substring
+    # check, which "factual"/etc. elsewhere in the fidelity constraints
+    # text would satisfy trivially either way).
+    assert "- (fact, Alice) relevant claim text" in prompt_text
+    assert "relevant subtopic" in prompt_text
+    # A2. Irrelevant topics do not reach the prompt.
+    assert "Irrelevant Topic" not in prompt_text
+    assert "irrelevant summary" not in prompt_text
+    assert "irrelevant claim text" not in prompt_text
+    assert "Bob" not in prompt_text
+    assert "irrelevant subtopic" not in prompt_text
+    # A4. Raw supporting chunks are still included.
+    assert "this section's own raw transcript excerpt" in prompt_text
+    # A5. Source references are not altered.
+    assert result.supporting_chunk_ids == [chunk.id]
+    assert result.supporting_topic_ids == [relevant.id]
+
+
+async def test_generate_section_omits_topic_notes_block_when_no_topics_are_relevant() -> None:
+    chunk = _chunk("raw text", 0)
+    planned_section = _planned_section(
+        sequence_number=0, heading="Section A", supporting_chunk_ids=[chunk.id], supporting_topic_ids=[]
+    )
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[GeneratedSection(heading="Section A", content="prose")]
+        )
+    )
+
+    await generate_section(
+        deps, planned_section, {chunk.id: chunk}, {},
+        article_title="T", section_headings=["Section A"],
+    )
+
+    messages, _, _ = deps.llm_provider.structured_calls[0]
+    assert "TOPIC NOTES" not in messages[0].content
+
+
+def test_section_generation_prompt_includes_article_title_and_ordered_headings() -> None:
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="The Grand Article",
+        section_headings=["Intro", "Middle Section", "Conclusion"],
+        current_section_number=1,
+    )
+
+    # B1. Article title included.
+    assert "The Grand Article" in user
+    # B2. Ordered section headings included, in order.
+    assert user.index("1. Intro") < user.index("2. Middle Section") < user.index("3. Conclusion")
+
+
+def test_section_generation_prompt_structure_block_contains_only_headings() -> None:
+    # B4 (structural proof): the ARTICLE STRUCTURE block can only ever
+    # contain the given headings -- there is no parameter through which
+    # another section's generated prose could reach it.
+    headings = ["Intro", "Middle Section", "Conclusion"]
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=headings,
+        current_section_number=1,
+    )
+
+    structure_block = user.split("ARTICLE STRUCTURE:\n", 1)[1].split("\nCURRENT SECTION", 1)[0]
+    lines = [line for line in structure_block.splitlines() if line.strip()]
+    assert len(lines) == len(headings)
+    for i, (line, heading) in enumerate(zip(lines, headings)):
+        assert line.startswith(f"{i + 1}. {heading}")
+
+
+def test_section_generation_prompt_identifies_the_current_section() -> None:
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle Section", "Conclusion"],
+        current_section_number=1,
+    )
+
+    # B3. Current section is identifiable, unambiguously, in two places:
+    # marked inline in the structure list, and restated with its position.
+    lines = user.splitlines()
+    marked_line = next(line for line in lines if "Middle Section" in line and line.strip().startswith("2."))
+    assert "YOU ARE WRITING THIS SECTION" in marked_line
+    assert "CURRENT SECTION (2 of 3): Middle Section" in user
+
+
+def test_section_generation_prompt_never_includes_other_sections_source_text() -> None:
+    own_chunk = _chunk("this section's own excerpt", 0)
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[own_chunk],  # only this section's own chunk, never the full transcript
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle Section", "Conclusion"],
+        current_section_number=1,
+    )
+
+    # B5. Full transcript is NOT accidentally included -- only the chunk
+    # actually passed in appears; nothing from any other section's chunks
+    # (which were simply never given to this call) can leak in.
+    assert own_chunk.text in user
+    assert user.count("[source excerpt") == 1

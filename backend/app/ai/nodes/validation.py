@@ -51,6 +51,8 @@ def build(deps: PipelineDeps):
             topics=state["topics"],
             transcript_word_count=state["transcript_word_count"],
             max_length_ratio=deps.settings.article_max_length_ratio,
+            min_sections=deps.settings.section_count_min,
+            max_sections=deps.settings.section_count_max,
         )
 
         checks_json = report.to_json()

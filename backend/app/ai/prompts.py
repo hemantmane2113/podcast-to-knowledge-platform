@@ -85,14 +85,19 @@ def topic_boundary_merge_prompt(candidates: list[tuple[int, TopicItem]]) -> tupl
     return system, user
 
 
-def planning_prompt(topics: list[Topic]) -> tuple[str, str]:
+def planning_prompt(
+    topics: list[Topic], *, target_section_count_min: int, target_section_count_max: int
+) -> tuple[str, str]:
     system = (
         "You are planning a knowledge article that turns a long-form podcast conversation into a "
         "substantially shorter, coherent, standalone article -- not a transcript summary. The article "
         "must be grounded in the topics below; do not invent a section about something not covered in "
         "them. Preserve important disagreements/contrasting viewpoints as their own planning notes so "
         "the writer doesn't flatten them later. Decide a sensible title, introduction, section "
-        "ordering, and conclusion."
+        "ordering, and conclusion. Aim for approximately "
+        f"{target_section_count_min}-{target_section_count_max} sections for a conversation of this "
+        "length -- fewer is fine if the conversation genuinely covers less ground, and more is fine if "
+        "it genuinely needs it, but never split or merge sections merely to hit a number."
     )
     topic_lines = "\n\n".join(
         f"[topic {t.sequence_number}] {t.title}\n{t.summary}\n"
@@ -107,30 +112,95 @@ def planning_prompt(topics: list[Topic]) -> tuple[str, str]:
     return system, user
 
 
+def _format_topic_note(topic: Topic) -> str:
+    lines = [f"Topic: {topic.title}", topic.summary]
+    if topic.key_claims:
+        claim_lines = [
+            f"- ({claim.get('claim_type', 'opinion')}, {claim.get('speaker') or 'unknown speaker'}) "
+            f"{claim.get('text', '')}"
+            for claim in topic.key_claims
+        ]
+        lines.append("Claims:\n" + "\n".join(claim_lines))
+    if topic.subtopics:
+        lines.append(f"Subtopics: {', '.join(topic.subtopics)}")
+    return "\n".join(lines)
+
+
 def section_generation_prompt(
+    *,
     heading: str,
     key_ideas: list[str],
     viewpoints: list[str],
     attribution_notes: list[str],
     supporting_chunks: list[Chunk],
+    relevant_topics: list[Topic],
+    article_title: str,
+    section_headings: list[str],
+    current_section_number: int,
     revision_feedback: str | None = None,
 ) -> tuple[str, str]:
+    """Returns (system, user) for generating one article section.
+
+    Three kinds of material, in strictly decreasing authority -- see the
+    system prompt below and PRODUCT_SPEC.md/ARCHITECTURE.md's fidelity
+    requirements:
+    1. `supporting_chunks` -- raw transcript excerpts. The only actual
+       evidence; every claim in the generated section must trace back to
+       these.
+    2. `relevant_topics` -- topic analysis's own summary/claims for the
+       topic(s) this section draws on (app/ai/nodes/topic_analysis.py).
+       An interpretation layered on top of the chunks, included so the
+       writer doesn't have to re-derive it from scratch, and to carry
+       forward each claim's speaker/claim_type for attribution -- never a
+       substitute for the chunks, and never authoritative if the two
+       disagree.
+    3. `section_headings`/`article_title` -- purely structural context
+       (this section's place in the whole article), carrying no factual
+       content of its own; used only so this section doesn't repeat
+       material another section owns.
+
+    Deliberately narrow on all three: only THIS section's own supporting
+    chunks and topics (never the full chunk set or the full knowledge
+    layer), and only the other sections' HEADINGS (never their generated
+    prose, which doesn't exist yet when sections are generated in
+    sequence, and is never resent even during a later revision).
+    """
     system = (
         "You are writing one section of a knowledge article derived from a podcast conversation. "
         f"{FIDELITY_CONSTRAINTS}\n\n"
+        "You are given three kinds of material, in order of authority. (1) SOURCE MATERIAL -- raw "
+        "transcript excerpts; the only actual evidence, and the sole source of truth for what was "
+        "said. (2) TOPIC NOTES -- a previously extracted summary and claims for context and "
+        "attribution only; this is an interpretation layered on the excerpts, not evidence in its own "
+        "right, and never outweighs the raw excerpts if the two ever seem to disagree. Where a claim's "
+        "speaker or claim_type (fact/opinion/speculation) is given, use it to distinguish stated facts "
+        "from opinions, speculation, or personal anecdotes in your writing -- but only when the source "
+        "excerpts actually support it. (3) ARTICLE TITLE/STRUCTURE -- purely structural, so you know "
+        "this section's place in the whole piece and avoid repeating material assigned to another "
+        "section; it carries no factual content of its own. "
         "Write substantive, readable prose (not bullet points, not a transcript excerpt) that a reader "
         "who never heard the podcast could understand on its own."
     )
-    chunk_text = "\n\n".join(f"[source excerpt {i}]\n{c.text}" for i, c in enumerate(supporting_chunks))
-    parts = [
-        f"Section heading: {heading}",
-        f"Key ideas to cover: {'; '.join(key_ideas) or '(none specified)'}",
-    ]
+
+    parts = [f"ARTICLE TITLE:\n{article_title}", "", "ARTICLE STRUCTURE:"]
+    for i, sec_heading in enumerate(section_headings):
+        marker = "  <-- YOU ARE WRITING THIS SECTION" if i == current_section_number else ""
+        parts.append(f"{i + 1}. {sec_heading}{marker}")
+
+    parts.append(f"\nCURRENT SECTION ({current_section_number + 1} of {len(section_headings)}): {heading}")
+    parts.append(f"Key ideas to cover: {'; '.join(key_ideas) or '(none specified)'}")
     if viewpoints:
         parts.append(f"Viewpoints/disagreements to preserve: {'; '.join(viewpoints)}")
     if attribution_notes:
         parts.append(f"Attribution notes: {'; '.join(attribution_notes)}")
-    parts.append(f"\nSource excerpts this section must be grounded in:\n\n{chunk_text}")
+
+    if relevant_topics:
+        topic_notes = "\n\n".join(_format_topic_note(t) for t in relevant_topics)
+        parts.append(f"\nTOPIC NOTES (interpretation/context only -- see SOURCE MATERIAL for evidence):\n\n{topic_notes}")
+
+    chunk_text = "\n\n".join(f"[source excerpt {i}]\n{c.text}" for i, c in enumerate(supporting_chunks))
+    parts.append(f"\nSOURCE MATERIAL (the actual evidence this section must be grounded in):\n\n{chunk_text}")
+
     if revision_feedback:
         parts.append(
             f"\nThe previous draft of this section had the following problem(s), fix them in this "

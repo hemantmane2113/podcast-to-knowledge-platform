@@ -12,6 +12,7 @@ from app.services.article_validation import (
     check_no_duplicate_sections,
     check_no_empty_sections,
     check_no_missing_planned_sections,
+    check_section_count,
     check_source_coverage,
     check_source_traceability,
     check_unsupported_content,
@@ -297,7 +298,57 @@ def test_broken_timestamp_references_ignores_unknown_chunk_ids() -> None:
     assert result.passed
 
 
-# --- run_validation: full integration of all 10 checks -------------------------------------
+# --- section count (pathological counts only, not the target range) -----------------------
+
+
+def test_section_count_passes_within_the_normal_range() -> None:
+    # 1. A normal count within the target range passes.
+    sections = [_section(sequence_number=i) for i in range(8)]
+    result = check_section_count(sections, min_sections=3, max_sections=20)
+    assert result.passed
+
+
+def test_section_count_fails_for_a_pathologically_low_count() -> None:
+    # 2. A pathological low count is detected.
+    sections = [_section(sequence_number=0)]
+    result = check_section_count(sections, min_sections=3, max_sections=20)
+    assert not result.passed
+    assert "1 section" in result.details
+
+
+def test_section_count_fails_for_a_pathologically_high_count() -> None:
+    # 3. A pathological high count is detected.
+    sections = [_section(sequence_number=i) for i in range(25)]
+    result = check_section_count(sections, min_sections=3, max_sections=20)
+    assert not result.passed
+    assert "25 section" in result.details
+
+
+def test_section_count_boundary_values() -> None:
+    # 4. Boundary values: exactly min/max pass (inclusive); one below/above fails.
+    at_min = [_section(sequence_number=i) for i in range(3)]
+    at_max = [_section(sequence_number=i) for i in range(20)]
+    below_min = [_section(sequence_number=i) for i in range(2)]
+    above_max = [_section(sequence_number=i) for i in range(21)]
+
+    assert check_section_count(at_min, min_sections=3, max_sections=20).passed
+    assert check_section_count(at_max, min_sections=3, max_sections=20).passed
+    assert not check_section_count(below_min, min_sections=3, max_sections=20).passed
+    assert not check_section_count(above_max, min_sections=3, max_sections=20).passed
+
+
+def test_section_count_does_not_reject_a_reasonable_article_slightly_outside_the_target_guidance() -> None:
+    # A 5- or 11-section article (just outside the planner's 6-10 TARGET
+    # guidance, app/ai/prompts.py::planning_prompt) must never be treated
+    # as pathological -- the validation bound is deliberately much wider
+    # than the target range.
+    five_sections = [_section(sequence_number=i) for i in range(5)]
+    eleven_sections = [_section(sequence_number=i) for i in range(11)]
+    assert check_section_count(five_sections, min_sections=3, max_sections=20).passed
+    assert check_section_count(eleven_sections, min_sections=3, max_sections=20).passed
+
+
+# --- run_validation: full integration of all 11 checks -------------------------------------
 
 
 def test_run_validation_passes_for_a_well_formed_article() -> None:
@@ -318,10 +369,14 @@ def test_run_validation_passes_for_a_well_formed_article() -> None:
         topics=[topic],
         transcript_word_count=10000,
         max_length_ratio=0.4,
+        # Permissive on purpose -- this test's single synthetic section
+        # exercises the OTHER 10 checks, not section-count pathology.
+        min_sections=1,
+        max_sections=20,
     )
 
     assert report.passed
-    assert len(report.checks) == 10
+    assert len(report.checks) == 11
     assert all(c.passed for c in report.checks)
 
 
@@ -337,6 +392,8 @@ def test_run_validation_fails_when_any_single_check_fails() -> None:
         topics=[],
         transcript_word_count=10000,
         max_length_ratio=0.4,
+        min_sections=1,
+        max_sections=20,
     )
 
     assert not report.passed
@@ -346,8 +403,15 @@ def test_run_validation_fails_when_any_single_check_fails() -> None:
 
 def test_validation_report_to_json_round_trips_check_shape() -> None:
     report = run_validation(
-        sections=[], plan=_plan(), chunks=[], topics=[], transcript_word_count=0, max_length_ratio=0.4
+        sections=[],
+        plan=_plan(),
+        chunks=[],
+        topics=[],
+        transcript_word_count=0,
+        max_length_ratio=0.4,
+        min_sections=1,
+        max_sections=20,
     )
     payload = report.to_json()
-    assert len(payload) == 10
+    assert len(payload) == 11
     assert all({"name", "passed", "details"} <= set(entry) for entry in payload)

@@ -88,7 +88,10 @@ async def test_pipeline_persists_topics_plan_article_and_passing_validation(
             _good_section(),
         ]
     )
-    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings())
+    # section_count_min=1: this fixture's single planned section exercises
+    # the OTHER checks, not section-count pathology (app/services/
+    # article_validation.py::check_section_count).
+    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings(section_count_min=1))
 
     initial_state: ArticlePipelineState = {
         "episode_id": episode.id,
@@ -129,7 +132,7 @@ async def test_pipeline_revises_a_failing_section_until_it_passes(db_session: As
             _good_section(),  # the revision's regenerated section
         ]
     )
-    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings())
+    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings(section_count_min=1))
 
     initial_state: ArticlePipelineState = {
         "episode_id": episode.id,

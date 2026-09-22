@@ -104,6 +104,23 @@ class Settings(BaseSettings):
     # limit: article_validation.py reports a violation, it doesn't block.
     article_max_length_ratio: float = 0.4
 
+    # Prompt guidance ONLY (app/ai/prompts.py::planning_prompt) -- the
+    # planner is instructed to aim for roughly this many sections for a
+    # typical long-form episode. Never enforced directly: a genuinely
+    # well-structured article landing just outside this range (5 or 11
+    # sections) is not a bug. See section_count_min/max below for the
+    # separate, much wider bound that deterministic validation actually
+    # enforces.
+    section_count_target_min: int = 6
+    section_count_target_max: int = 10
+    # Deterministic validation bound (app/services/article_validation.py's
+    # check_section_count) -- deliberately wider than the target guidance
+    # above. Only a genuinely pathological count (a near-empty "article",
+    # or runaway fragmentation) fails this; ordinary variation around the
+    # target never does.
+    section_count_min: int = 3
+    section_count_max: int = 20
+
     admin_auth_secret: str = ""
 
     @model_validator(mode="after")

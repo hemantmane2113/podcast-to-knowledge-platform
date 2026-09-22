@@ -20,7 +20,11 @@ def build(deps: PipelineDeps):
         topics = state["topics"]
         topics_by_sequence = {t.sequence_number: t for t in topics}
 
-        system, user = planning_prompt(topics)
+        system, user = planning_prompt(
+            topics,
+            target_section_count_min=deps.settings.section_count_target_min,
+            target_section_count_max=deps.settings.section_count_target_max,
+        )
         result: ArticlePlanResult = await deps.llm_provider.generate_structured(
             messages=[LLMMessage(role="user", content=user)],
             system=system,
