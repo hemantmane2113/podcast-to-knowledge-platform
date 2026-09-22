@@ -44,6 +44,29 @@ def _build_messages(messages: list[LLMMessage], system: str | None) -> list[dict
     return payload
 
 
+def _build_create_kwargs(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int | None,
+    response_format: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """`max_tokens=None` must be *omitted*, not passed through as a literal
+    null -- OpenAI's API rejects `max_tokens: null` with a 400 ("Invalid
+    type for 'max_tokens': expected an unsupported value, but got null
+    instead"), found via a real fallback run: Groq tolerates `null` here,
+    OpenAI (used as the fallback provider) does not, so the difference
+    only ever surfaced once a real Groq failure actually triggered the
+    OpenAI path."""
+    kwargs: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    return kwargs
+
+
 def _extract_text_and_usage(response: Any) -> tuple[str, LLMUsage | None]:
     text = response.choices[0].message.content or ""
     usage = None
@@ -127,10 +150,12 @@ class ChatCompletionsProvider(LLMProvider):
     ) -> LLMTextResponse:
         try:
             response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=_build_messages(messages, system),
-                temperature=temperature,
-                max_tokens=max_tokens,
+                **_build_create_kwargs(
+                    model=self._model,
+                    messages=_build_messages(messages, system),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             )
         except Exception as exc:
             raise self._map_exception(exc) from exc
@@ -160,11 +185,13 @@ class ChatCompletionsProvider(LLMProvider):
         for _ in range(2):  # one real attempt + one good-faith retry
             try:
                 response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=payload_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
+                    **_build_create_kwargs(
+                        model=self._model,
+                        messages=payload_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        response_format={"type": "json_object"},
+                    )
                 )
             except Exception as exc:
                 raise self._map_exception(exc) from exc

@@ -228,6 +228,30 @@ async def test_generate_wraps_client_exception_via_map_exception() -> None:
         await provider.generate(messages=[LLMMessage(role="user", content="hi")])
 
 
+async def test_generate_omits_max_tokens_when_none() -> None:
+    """max_tokens=None must be omitted from the SDK call entirely, not
+    passed through as a literal null -- OpenAI's API rejects
+    `max_tokens: null` with a 400 (found via a real Groq -> OpenAI
+    fallback run)."""
+    create = AsyncMock(return_value=_fake_completion("hello"))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    await provider.generate(messages=[LLMMessage(role="user", content="hi")], max_tokens=None)
+
+    assert "max_tokens" not in create.call_args.kwargs
+
+
+async def test_generate_preserves_an_explicit_max_tokens() -> None:
+    create = AsyncMock(return_value=_fake_completion("hello"))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    await provider.generate(messages=[LLMMessage(role="user", content="hi")], max_tokens=256)
+
+    assert create.call_args.kwargs["max_tokens"] == 256
+
+
 # --- generate_structured(): parsing, retry, schema mismatch -------------------------
 
 
@@ -248,6 +272,34 @@ async def test_generate_structured_parses_valid_json_on_first_try() -> None:
 
     assert result == _Example(title="hello", count=3)
     assert client.chat.completions.create.call_count == 1
+
+
+async def test_generate_structured_omits_max_tokens_when_none() -> None:
+    create = AsyncMock(return_value=_fake_completion(json.dumps({"title": "x", "count": 1})))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example, max_tokens=None
+    )
+
+    assert "max_tokens" not in create.call_args.kwargs
+
+
+async def test_generate_structured_preserves_an_explicit_max_tokens() -> None:
+    create = AsyncMock(return_value=_fake_completion(json.dumps({"title": "x", "count": 1})))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="give me json")], response_model=_Example, max_tokens=512
+    )
+
+    assert create.call_args.kwargs["max_tokens"] == 512
 
 
 async def test_generate_structured_retries_once_on_invalid_json_then_succeeds() -> None:
