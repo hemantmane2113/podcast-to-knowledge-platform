@@ -12,6 +12,19 @@ from app.worker.tasks import MAX_TRIES, generate_article, ingest_episode_transcr
 
 logger = logging.getLogger(__name__)
 
+# arq's own default (300s) is too short for generate_article: the V1
+# pipeline is a strictly sequential chain (topic analysis -- possibly
+# several batches -- -> planning -> one real LLM call per planned
+# section -> validation -> up to max_revision_attempts more rounds), and
+# a normal, fully successful run against a real, long podcast transcript
+# can legitimately take several minutes. Raised to 20 minutes so a
+# correctly-running job isn't killed partway through; still bounded (not
+# removed) -- a job that runs long past this is still cancelled and,
+# since commit 73b6191, still cleanly marked FAILED rather than left
+# stuck (app/worker/tasks.py::generate_article's
+# `except asyncio.CancelledError` handling, unchanged here).
+JOB_TIMEOUT_SECONDS = 1200
+
 
 async def startup(ctx: dict) -> None:
     settings = get_settings()
@@ -53,5 +66,6 @@ class WorkerSettings:
     functions = [ingest_episode_transcript, process_transcript, generate_article]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_tries = MAX_TRIES
+    job_timeout = JOB_TIMEOUT_SECONDS
     on_startup = startup
     on_shutdown = shutdown

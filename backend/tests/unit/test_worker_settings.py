@@ -14,7 +14,7 @@ running these tests.
 
 import app.worker.settings as worker_settings
 import app.worker.tasks as worker_tasks
-from app.worker.settings import startup
+from app.worker.settings import JOB_TIMEOUT_SECONDS, WorkerSettings, startup
 
 
 async def test_startup_does_not_populate_llm_provider_in_ctx() -> None:
@@ -45,3 +45,16 @@ def test_worker_tasks_module_does_not_import_get_llm_provider_at_module_level() 
     register its arq functions) never requires groq/openai to be
     installed. Only actually running generate_article does."""
     assert not hasattr(worker_tasks, "get_llm_provider")
+
+
+def test_worker_settings_explicitly_configures_a_1200_second_job_timeout() -> None:
+    """arq's own default (300s) is too short for generate_article: the V1
+    pipeline is a strictly sequential chain of real LLM calls (topic
+    analysis, possibly several batches -> planning -> one call per
+    planned section -> validation -> up to max_revision_attempts more
+    rounds), and a normal, fully successful run against a real, long
+    podcast transcript can legitimately take several minutes -- a real
+    run was killed mid-pipeline by the 300s default. Raised explicitly,
+    in version control, rather than left at arq's implicit default."""
+    assert JOB_TIMEOUT_SECONDS == 1200
+    assert WorkerSettings.job_timeout == 1200
