@@ -17,6 +17,7 @@ from app.ai.nodes.section_generation import (
     collect_preceding_key_ideas,
     excerpt_preceding_section,
     generate_section,
+    next_section_narrative_purpose,
     order_plan_sections,
     section_word_target,
 )
@@ -99,6 +100,7 @@ def build(deps: PipelineDeps):
                         preceding_section_excerpt=(
                             excerpt_preceding_section(preceding_content) if preceding_content else None
                         ),
+                        next_narrative_purpose=next_section_narrative_purpose(ordered_sections, seq),
                         target_word_count_min=word_target_min,
                         target_word_count_max=word_target_max,
                         revision_feedback="; ".join(feedback_parts) or None,

@@ -87,6 +87,22 @@ def excerpt_preceding_section(content: str) -> str:
     return "..." + tail[-_PRECEDING_EXCERPT_MAX_CHARS:]
 
 
+def next_section_narrative_purpose(ordered_sections: list[dict], sequence_number: int) -> str | None:
+    """"Where appropriate, the direction of the next section" (Batch 4
+    editorial rework): a single short forward-looking signal -- the
+    immediately FOLLOWING section's own planned narrative_purpose. Never
+    its heading (already visible in ARTICLE STRUCTURE) and never its
+    transition_from_previous (that's written from the NEXT section's own
+    perspective looking back at this one, which would be circular here).
+    None when there is no next section, or the plan has no purpose
+    recorded for it (an older/incomplete plan) -- "where appropriate" is
+    handled by simply omitting the line, not by inventing one."""
+    for s in ordered_sections:
+        if s["sequence_number"] == sequence_number + 1:
+            return s.get("narrative_purpose") or None
+    return None
+
+
 def section_word_target(settings: Settings, section_count: int) -> tuple[int | None, int | None]:
     """A rough, soft per-section word-count guideline derived from
     Settings.article_target_word_count_min/max -- an even split across the
@@ -113,6 +129,7 @@ async def generate_section(
     conclusion_summary: str = "",
     preceding_sections_key_ideas: list[tuple[str, list[str]]] | None = None,
     preceding_section_excerpt: str | None = None,
+    next_narrative_purpose: str | None = None,
     target_word_count_min: int | None = None,
     target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
@@ -144,6 +161,7 @@ async def generate_section(
         conclusion_summary=conclusion_summary,
         preceding_sections_key_ideas=preceding_sections_key_ideas,
         preceding_section_excerpt=preceding_section_excerpt,
+        next_narrative_purpose=next_narrative_purpose,
         target_word_count_min=target_word_count_min,
         target_word_count_max=target_word_count_max,
         revision_feedback=revision_feedback,
@@ -221,6 +239,7 @@ def build(deps: PipelineDeps):
                 preceding_section_excerpt=(
                     excerpt_preceding_section(preceding_content) if preceding_content else None
                 ),
+                next_narrative_purpose=next_section_narrative_purpose(ordered_sections, seq),
                 target_word_count_min=word_target_min,
                 target_word_count_max=word_target_max,
             )

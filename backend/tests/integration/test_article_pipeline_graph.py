@@ -291,6 +291,13 @@ async def test_pipeline_passes_narrative_context_and_already_covered_material_to
     assert "idea C" not in body_prompt
     assert "ARTICLE'S OPENING SECTION" not in body_prompt
     assert "ARTICLE'S CLOSING SECTION" not in body_prompt
+    # A middle section also gets the article's central question (via the
+    # new compact line, not the opening/closing block) and a short
+    # forward-looking hint of the FOLLOWING section's own purpose -- never
+    # its heading restated or its (nonexistent-yet) prose.
+    assert "central question X" in body_prompt
+    assert "What comes after this section" in body_prompt
+    assert "purpose C" in body_prompt
 
     # Section 2 (closing): gets the conclusion-specific block, layer-1
     # context from BOTH earlier sections' planned key ideas, but layer-2

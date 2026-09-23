@@ -205,6 +205,7 @@ def section_generation_prompt(
     conclusion_summary: str = "",
     preceding_sections_key_ideas: list[tuple[str, list[str]]] | None = None,
     preceding_section_excerpt: str | None = None,
+    next_narrative_purpose: str | None = None,
     target_word_count_min: int | None = None,
     target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
@@ -234,44 +235,76 @@ def section_generation_prompt(
     layer), and only the other sections' HEADINGS (never their generated
     prose) reach the ARTICLE STRUCTURE block above.
 
-    Separately, for editorial coherence (not evidence): `narrative_purpose`/
-    `transition_from_previous` are this section's own planning notes;
-    `preceding_sections_key_ideas` is each EARLIER section's own planned
-    key_ideas (never full prose -- see app/ai/nodes/section_generation.py,
-    which builds this from the plan, not from the article); and
-    `preceding_section_excerpt` is a short, deterministically-truncated
-    tail of the IMMEDIATELY preceding section's actual generated content
-    (not an LLM summary -- see the same module's excerpt_preceding_section).
-    None of these carry new factual claims of their own; they exist purely
-    so this section can flow from and build on what came before instead of
-    re-explaining it.
+    Separately, for editorial coherence (not evidence): `introduction_summary`
+    is the article's own central idea/question/tension, shown to every
+    section (not just the first/last) so a middle section can still write
+    toward it, not just the ones with a special opening/closing block;
+    `narrative_purpose`/`transition_from_previous` are this section's own
+    planning notes; `preceding_sections_key_ideas` is each EARLIER
+    section's own planned key_ideas (never full prose -- see
+    app/ai/nodes/section_generation.py, which builds this from the plan,
+    not from the article); `preceding_section_excerpt` is a short,
+    deterministically-truncated tail of the IMMEDIATELY preceding
+    section's actual generated content (not an LLM summary -- see the same
+    module's excerpt_preceding_section); and `next_narrative_purpose` is a
+    single short forward-looking line -- the immediately FOLLOWING
+    section's own planned purpose, never its heading (already visible in
+    ARTICLE STRUCTURE) or its prose (doesn't exist yet). None of these
+    carry new factual claims of their own; they exist purely so this
+    section reads as part of ONE continuous article, not an independent
+    summary of a transcript slice.
     """
     system = (
         "You are writing one section of a knowledge article derived from a podcast conversation. The "
-        "article as a whole should read as a coherent, engaging editorial piece -- not a collection of "
-        f"transcript summaries stitched together. {FIDELITY_CONSTRAINTS}\n\n"
+        "article as a whole must read as ONE continuous, coherent, engaging editorial piece -- not a "
+        f"collection of independent summaries stitched together. {FIDELITY_CONSTRAINTS}\n\n"
         "You are given three kinds of evidentiary material, in order of authority. (1) SOURCE MATERIAL "
         "-- raw transcript excerpts; the only actual evidence, and the sole source of truth for what was "
-        "said. (2) TOPIC NOTES -- a previously extracted summary and claims for context and "
-        "attribution only; this is an interpretation layered on the excerpts, not evidence in its own "
-        "right, and never outweighs the raw excerpts if the two ever seem to disagree. Where a claim's "
-        "speaker or claim_type (fact/opinion/speculation) is given, use it to distinguish stated facts "
-        "from opinions, speculation, or personal anecdotes in your writing -- but only when the source "
-        "excerpts actually support it. (3) ARTICLE TITLE/STRUCTURE -- purely structural, so you know "
-        "this section's place in the whole piece and avoid repeating material assigned to another "
-        "section; it carries no factual content of its own.\n\n"
-        "You are also given editorial context (not evidence): this section's intended purpose and how "
-        "it follows the previous one, and a compact view of what earlier sections already covered. Use "
-        "this to write a natural continuation -- build on ideas already introduced rather than "
-        "re-explaining them from scratch, unless you are adding a genuinely new layer to one. Only "
-        "repeat something already covered when that new layer earns it.\n\n"
-        "Write substantive, readable prose (not bullet points, not a transcript excerpt) that a reader "
-        "who never heard the podcast could understand on its own. Vary how paragraphs open -- do not "
-        'repeatedly start with constructions like "X says", "X explains", or "X argues" -- and avoid '
-        'repetitive AI-style transitions such as "In conclusion", "Furthermore", "Moreover", or '
-        '"Another important aspect is". Where the transcript naturally supports it, use questions, '
-        "contrasts, concrete examples, or a brief story to give the reader a reason to keep reading -- "
-        "never invented drama, sensationalism, or fake suspense."
+        "said. Do not pull in anything outside these excerpts even if it would improve the prose, and "
+        "if the same idea appears in several excerpts, that repetition belongs to the transcript, not a "
+        "reason to explain the idea more than once here. (2) TOPIC NOTES -- a previously extracted "
+        "summary and claims for context and attribution only; this is an interpretation layered on the "
+        "excerpts, not evidence in its own right, and never outweighs the raw excerpts if the two ever "
+        "seem to disagree. Where a claim's speaker or claim_type (fact/opinion/speculation) is given, "
+        "use it to distinguish a stated fact from an opinion, speculation, personal experience, or "
+        "disagreement in your writing -- but only when the source excerpts actually support it. "
+        "(3) ARTICLE TITLE/STRUCTURE -- purely structural, so you know this section's place in the whole "
+        "piece and avoid repeating material assigned to another section; it carries no factual content "
+        "of its own.\n\n"
+        "You are also given editorial context (not evidence): the article's central question, this "
+        "section's own purpose and how it follows the previous one, sometimes a hint of where the "
+        "following section is headed, and a compact view of what earlier sections already covered. Use "
+        "this to write a natural continuation of the SAME article, not a standalone piece -- build on "
+        "ideas already introduced rather than re-explaining them from scratch, unless you are adding a "
+        "genuinely different layer (a complication, a new angle, a consequence). Never invent a fact, "
+        "motivation, causal relationship, or speaker intention the source doesn't support, and never "
+        "write a transition that implies a connection the source doesn't actually show.\n\n"
+        "Do not open by mechanically restating the section heading, and do not open with a "
+        'meta-referential phrase like "in the previous section", "building on what we discussed", "as '
+        'mentioned earlier", or "next, we turn to" -- enter the idea naturally. A section that isn\'t '
+        "the article's first should normally pick up from where the previous one left off and move into "
+        "its own territory through the ideas themselves, not through an announced transition. Don't "
+        "force a tidy mini-summary at the end of every section either -- where the material genuinely "
+        "supports it, let the closing lines open toward what comes next, but never manufacture a bridge "
+        "the source doesn't actually support.\n\n"
+        "Personal stories, concrete examples, and moments of disagreement or tension are valuable when "
+        "they sharpen the reader's understanding or engagement -- use them for that, not because an "
+        "anecdote happens to be available in the source, and not as a checklist item; don't give every "
+        "anecdote its own point of emphasis. Favor concrete examples, meaningful contrasts, genuine "
+        "cause-and-effect, unresolved questions, and real implications over clickbait, manufactured "
+        "drama, exaggerated claims, generic motivational language, or artificial suspense.\n\n"
+        "Write substantive, precise, concrete prose (not bullet points, not a transcript excerpt) that a "
+        "reader who never heard the podcast could understand on its own -- the minimum prose that "
+        "communicates the assigned ideas clearly and engagingly, not the most you could write. Vary "
+        "paragraph length, sentence structure, and how paragraphs open; do not repeatedly start with "
+        'constructions like "X says", "X explains", or "X argues", but never drop attribution simply to '
+        "vary the prose -- stay clear about whether you're reporting a claim, evidence, personal "
+        "experience, interpretation, disagreement, or uncertainty, since dropping attribution can "
+        "quietly turn a speaker's claim into an unqualified fact. Avoid formulaic AI-writing patterns -- "
+        'phrases like "in conclusion", "furthermore", "moreover", "another important aspect", "it is '
+        'important to note", "this highlights the importance of", "in today\'s fast-paced world", or "at '
+        'the end of the day" -- not as a mechanical ban (one may occasionally belong) but because they '
+        "signal generic, templated prose; the goal is writing that doesn't read like a formula."
     )
 
     parts = [f"ARTICLE TITLE:\n{article_title}", "", "ARTICLE STRUCTURE:"]
@@ -292,6 +325,23 @@ def section_generation_prompt(
 
     is_first_section = current_section_number == 0
     is_last_section = current_section_number == len(section_headings) - 1
+
+    # The article's central question, shown to every MIDDLE section (not
+    # just first/last, which already get the fuller opening/closing blocks
+    # below that include this same text) -- otherwise a middle section has
+    # no access to it at all, despite introduction_summary already being
+    # passed to every section by generate_section.
+    if not is_first_section and not is_last_section and introduction_summary:
+        parts.append(
+            f"\nThe article's central question/tension (established in the introduction): "
+            f"{introduction_summary}"
+        )
+    # "Where appropriate, the direction of the next section" -- a single
+    # short forward-looking line, never the next section's heading (already
+    # visible above) or its prose (doesn't exist yet).
+    if next_narrative_purpose:
+        parts.append(f"\nWhat comes after this section: {next_narrative_purpose}")
+
     if is_first_section and introduction_summary:
         parts.append(
             "\nThis is the ARTICLE'S OPENING SECTION. Beyond the key ideas above, use it to establish "
@@ -340,9 +390,10 @@ def section_generation_prompt(
 
     if target_word_count_min and target_word_count_max:
         parts.append(
-            f"\nThis section should run roughly {target_word_count_min}-{target_word_count_max} words "
-            "-- an approximate guide, not a hard limit; do not pad to reach it or cut a genuinely "
-            "necessary point just to stay under it."
+            f"\nThis section should run roughly {target_word_count_min}-{target_word_count_max} words -- "
+            "a loose guide, not a target to fill. Use the minimum prose that communicates the assigned "
+            "ideas clearly and engagingly, not the most you could write; never pad to reach the range, "
+            "and never cut a genuinely necessary point just to stay under it."
         )
 
     chunk_text = "\n\n".join(f"[source excerpt {i}]\n{c.text}" for i, c in enumerate(supporting_chunks))

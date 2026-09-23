@@ -14,6 +14,7 @@ from app.ai.nodes.section_generation import (
     collect_preceding_key_ideas,
     excerpt_preceding_section,
     generate_section,
+    next_section_narrative_purpose,
     section_headings_by_sequence,
     section_word_target,
 )
@@ -923,6 +924,70 @@ def test_section_generation_prompt_includes_soft_word_target_when_given() -> Non
     assert "1000" not in without_target
 
 
+def test_section_generation_prompt_shows_the_central_question_to_middle_sections_only() -> None:
+    """Regression test: introduction_summary was already reaching this
+    function for every section, but only the first/last section's own
+    elaborate opening/closing block ever rendered it -- a middle section
+    had no access to the article's central question at all. Middle
+    sections now get a compact standalone line; first/last sections still
+    get it via their existing elaborate block, not duplicated."""
+    kwargs = dict(
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        introduction_summary="the central tension is whether X or Y",
+    )
+    _, first = section_generation_prompt(heading="Intro", current_section_number=0, **kwargs)
+    _, middle = section_generation_prompt(heading="Middle", current_section_number=1, **kwargs)
+    _, last = section_generation_prompt(
+        heading="Conclusion", current_section_number=2, conclusion_summary="c", **kwargs
+    )
+
+    assert "the central tension is whether X or Y" in first  # via the opening block
+    assert "the central tension is whether X or Y" in middle  # via the new compact line
+    assert "the central tension is whether X or Y" in last  # via the closing block
+    # The compact standalone line itself only applies to middle sections --
+    # first/last already state the central question through their own,
+    # more elaborate block.
+    assert "central question/tension (established in the introduction)" in middle
+    assert "central question/tension (established in the introduction)" not in first
+    assert "central question/tension (established in the introduction)" not in last
+
+
+def test_section_generation_prompt_includes_next_section_direction_when_given() -> None:
+    _, with_next = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+        next_narrative_purpose="Explore the practical implications of the mechanism just shown.",
+    )
+    _, without_next = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+    )
+
+    assert "What comes after this section" in with_next
+    assert "Explore the practical implications of the mechanism just shown." in with_next
+    assert "What comes after this section" not in without_next
+
+
 def test_collect_preceding_key_ideas_returns_only_earlier_sections_in_order() -> None:
     ordered = [
         {"sequence_number": 0, "heading": "Intro", "key_ideas": ["a"]},
@@ -933,6 +998,30 @@ def test_collect_preceding_key_ideas_returns_only_earlier_sections_in_order() ->
     assert collect_preceding_key_ideas(ordered, 0) == []
     assert collect_preceding_key_ideas(ordered, 1) == [("Intro", ["a"])]
     assert collect_preceding_key_ideas(ordered, 2) == [("Intro", ["a"]), ("Middle", ["b"])]
+
+
+def test_next_section_narrative_purpose_returns_the_following_sections_purpose() -> None:
+    ordered = [
+        {"sequence_number": 0, "heading": "Intro", "narrative_purpose": "purpose A"},
+        {"sequence_number": 1, "heading": "Middle", "narrative_purpose": "purpose B"},
+        {"sequence_number": 2, "heading": "Conclusion", "narrative_purpose": "purpose C"},
+    ]
+
+    assert next_section_narrative_purpose(ordered, 0) == "purpose B"
+    assert next_section_narrative_purpose(ordered, 1) == "purpose C"
+    assert next_section_narrative_purpose(ordered, 2) is None  # no section follows the last one
+
+
+def test_next_section_narrative_purpose_handles_missing_or_blank_purpose() -> None:
+    ordered = [
+        {"sequence_number": 0, "heading": "Intro"},  # no narrative_purpose key at all
+        {"sequence_number": 1, "heading": "Middle", "narrative_purpose": ""},
+    ]
+
+    # Next section (seq 1) has no usable purpose (missing key or blank) --
+    # None either way, never an error, and never an empty-string line in
+    # the prompt.
+    assert next_section_narrative_purpose(ordered, 0) is None
 
 
 def test_excerpt_preceding_section_uses_the_last_paragraph() -> None:
@@ -992,8 +1081,10 @@ async def test_generate_section_forwards_narrative_and_already_covered_context_t
         {},
         article_title="T",
         section_headings=["Intro", "Body", "Conclusion"],
+        introduction_summary="the central tension is X",
         preceding_sections_key_ideas=[("Intro", ["idea one"])],
         preceding_section_excerpt="how the intro ended",
+        next_narrative_purpose="Explore what this implies in practice.",
         target_word_count_min=500,
         target_word_count_max=800,
     )
@@ -1002,8 +1093,10 @@ async def test_generate_section_forwards_narrative_and_already_covered_context_t
     prompt_text = system + messages[0].content
     assert "Show the mechanism." in prompt_text
     assert "Because the claim was just established." in prompt_text
+    assert "the central tension is X" in prompt_text
     assert "idea one" in prompt_text
     assert "how the intro ended" in prompt_text
+    assert "Explore what this implies in practice." in prompt_text
     assert "500" in prompt_text and "800" in prompt_text
 
 
