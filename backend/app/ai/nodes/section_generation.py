@@ -21,6 +21,7 @@ import uuid
 from app.ai.prompts import section_generation_prompt
 from app.ai.schemas import GeneratedSection
 from app.ai.state import ArticlePipelineState, PipelineDeps
+from app.config.settings import Settings
 from app.models.chunk import Chunk
 from app.models.episode import ProcessingStatus
 from app.models.topic import Topic
@@ -29,6 +30,8 @@ from app.repositories.article_repository import ArticleSectionCandidate
 from app.services.article_validation import is_section_content_valid
 
 logger = logging.getLogger(__name__)
+
+_PRECEDING_EXCERPT_MAX_CHARS = 500
 
 
 def section_headings_by_sequence(plan_sections: list[dict]) -> list[str]:
@@ -42,6 +45,62 @@ def section_headings_by_sequence(plan_sections: list[dict]) -> list[str]:
     return [s["heading"] for s in ordered]
 
 
+def order_plan_sections(plan_sections: list[dict]) -> list[dict]:
+    """Same ordering guarantee as section_headings_by_sequence, but
+    returning the full section dicts -- shared by section_generation_node
+    and revision_node so both build "already covered by earlier sections"
+    context (see collect_preceding_key_ideas) against the same, consistent
+    ordering."""
+    return sorted(plan_sections, key=lambda s: s["sequence_number"])
+
+
+def collect_preceding_key_ideas(ordered_sections: list[dict], sequence_number: int) -> list[tuple[str, list[str]]]:
+    """Layer 1 of "already covered" context (Batch 3 editorial rework):
+    every earlier section's own PLANNED key_ideas -- cheap (already in
+    memory, no extra DB read) and available even for the very first
+    section of a resumed/revised run. Deliberately not assumed to be a
+    perfect record of what was actually written (planned intent can drift
+    from generated prose) -- see excerpt_preceding_section below for the
+    complementary, actually-generated-content layer. Shared by
+    section_generation_node and revision_node (app/ai/nodes/revision.py)."""
+    return [
+        (s["heading"], s.get("key_ideas", []))
+        for s in ordered_sections
+        if s["sequence_number"] < sequence_number
+    ]
+
+
+def excerpt_preceding_section(content: str) -> str:
+    """Layer 2 of "already covered" context: a short, PURELY DETERMINISTIC
+    (never an extra LLM call) tail of the immediately preceding section's
+    actual generated content -- how it ended, so the next section can pick
+    up the thread and avoid an abrupt jump. Takes the last paragraph (most
+    relevant for a transition), normalizes whitespace, and hard-truncates
+    to a small char budget -- never the immediately preceding section's
+    full prose, and never any section other than the immediately preceding
+    one (see section_generation_prompt's docstring)."""
+    paragraphs = [p for p in content.strip().split("\n\n") if p.strip()]
+    tail = paragraphs[-1] if paragraphs else content.strip()
+    tail = " ".join(tail.split())
+    if len(tail) <= _PRECEDING_EXCERPT_MAX_CHARS:
+        return tail
+    return "..." + tail[-_PRECEDING_EXCERPT_MAX_CHARS:]
+
+
+def section_word_target(settings: Settings, section_count: int) -> tuple[int | None, int | None]:
+    """A rough, soft per-section word-count guideline derived from
+    Settings.article_target_word_count_min/max -- an even split across the
+    planned section count, presented to the model as approximate guidance
+    (see section_generation_prompt), never a hard constraint. None/None
+    when there's nothing to divide across (an empty plan)."""
+    if section_count <= 0:
+        return None, None
+    return (
+        settings.article_target_word_count_min // section_count,
+        settings.article_target_word_count_max // section_count,
+    )
+
+
 async def generate_section(
     deps: PipelineDeps,
     planned_section: dict,
@@ -50,6 +109,12 @@ async def generate_section(
     *,
     article_title: str,
     section_headings: list[str],
+    introduction_summary: str = "",
+    conclusion_summary: str = "",
+    preceding_sections_key_ideas: list[tuple[str, list[str]]] | None = None,
+    preceding_section_excerpt: str | None = None,
+    target_word_count_min: int | None = None,
+    target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
 ) -> ArticleSectionCandidate:
     supporting_chunk_ids = [uuid.UUID(cid) for cid in planned_section.get("supporting_chunk_ids", [])]
@@ -69,6 +134,18 @@ async def generate_section(
         article_title=article_title,
         section_headings=section_headings,
         current_section_number=planned_section["sequence_number"],
+        # .get(..., "") -- an ArticlePlan persisted before these two
+        # fields existed (or a test fixture that omits them) has no such
+        # keys; treated the same as "the planner didn't provide one"
+        # rather than raising.
+        narrative_purpose=planned_section.get("narrative_purpose", ""),
+        transition_from_previous=planned_section.get("transition_from_previous", ""),
+        introduction_summary=introduction_summary,
+        conclusion_summary=conclusion_summary,
+        preceding_sections_key_ideas=preceding_sections_key_ideas,
+        preceding_section_excerpt=preceding_section_excerpt,
+        target_word_count_min=target_word_count_min,
+        target_word_count_max=target_word_count_max,
         revision_feedback=revision_feedback,
     )
     result: GeneratedSection = await deps.llm_provider.generate_structured(
@@ -96,7 +173,9 @@ def build(deps: PipelineDeps):
         plan = state["plan"]
         chunk_by_id = {c.id: c for c in state["chunks"]}
         topic_by_id = {t.id: t for t in state["topics"]}
-        section_headings = section_headings_by_sequence(plan.sections)
+        ordered_sections = order_plan_sections(plan.sections)
+        section_headings = [s["heading"] for s in ordered_sections]
+        word_target_min, word_target_max = section_word_target(deps.settings, len(ordered_sections))
 
         # get_or_create reuses the existing Article (sections and all) if
         # it already belongs to this plan -- see its docstring for the
@@ -110,16 +189,25 @@ def build(deps: PipelineDeps):
         await deps.session.commit()
 
         existing_by_sequence = {s.sequence_number: s for s in article.sections}
+        # Tracks each section's ACTUAL generated content (reused or freshly
+        # generated) as the loop proceeds, keyed by sequence_number -- the
+        # source for the immediately-preceding-section excerpt (layer 2 of
+        # "already covered" context). Built incrementally rather than read
+        # once from existing_by_sequence, since a section generated earlier
+        # in THIS SAME pass isn't in existing_by_sequence at all yet.
+        generated_content_by_sequence: dict[int, str] = {}
 
-        for planned_section in plan.sections:
+        for planned_section in ordered_sections:
             seq = planned_section["sequence_number"]
             existing = existing_by_sequence.get(seq)
             if existing is not None and is_section_content_valid(existing.heading, existing.content):
                 # Already generated (and valid) in a prior attempt -- no
                 # LLM call, no write.
                 logger.info("Section generation: reusing already-persisted section %d", seq)
+                generated_content_by_sequence[seq] = existing.content
                 continue
 
+            preceding_content = generated_content_by_sequence.get(seq - 1)
             candidate = await generate_section(
                 deps,
                 planned_section,
@@ -127,6 +215,14 @@ def build(deps: PipelineDeps):
                 topic_by_id,
                 article_title=plan.title,
                 section_headings=section_headings,
+                introduction_summary=plan.introduction_summary,
+                conclusion_summary=plan.conclusion_summary,
+                preceding_sections_key_ideas=collect_preceding_key_ideas(ordered_sections, seq),
+                preceding_section_excerpt=(
+                    excerpt_preceding_section(preceding_content) if preceding_content else None
+                ),
+                target_word_count_min=word_target_min,
+                target_word_count_max=word_target_max,
             )
             # Persisted (and committed) immediately after this section's
             # own LLM call succeeds -- a failed/raising call never reaches
@@ -135,6 +231,7 @@ def build(deps: PipelineDeps):
             # invalid-existing-row replace-in-place case).
             deps.articles.upsert_section(article, candidate)
             await deps.session.commit()
+            generated_content_by_sequence[seq] = candidate.content
 
         return {"article": article}
 

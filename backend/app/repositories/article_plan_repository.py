@@ -21,6 +21,8 @@ class PlannedSectionData:
     supporting_chunk_ids: list[str]
     viewpoints: list[str] = field(default_factory=list)
     attribution_notes: list[str] = field(default_factory=list)
+    narrative_purpose: str = ""
+    transition_from_previous: str = ""
 
 
 class ArticlePlanRepository:
@@ -65,6 +67,8 @@ class ArticlePlanRepository:
                     "supporting_chunk_ids": s.supporting_chunk_ids,
                     "viewpoints": s.viewpoints,
                     "attribution_notes": s.attribution_notes,
+                    "narrative_purpose": s.narrative_purpose,
+                    "transition_from_previous": s.transition_from_previous,
                 }
                 for s in sections
             ],

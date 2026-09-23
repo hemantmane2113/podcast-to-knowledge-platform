@@ -86,18 +86,41 @@ def topic_boundary_merge_prompt(candidates: list[tuple[int, TopicItem]]) -> tupl
 
 
 def planning_prompt(
-    topics: list[Topic], *, target_section_count_min: int, target_section_count_max: int
+    topics: list[Topic],
+    *,
+    target_section_count_min: int,
+    target_section_count_max: int,
+    target_word_count_min: int,
+    target_word_count_max: int,
 ) -> tuple[str, str]:
     system = (
         "You are planning a knowledge article that turns a long-form podcast conversation into a "
-        "substantially shorter, coherent, standalone article -- not a transcript summary. The article "
-        "must be grounded in the topics below; do not invent a section about something not covered in "
-        "them. Preserve important disagreements/contrasting viewpoints as their own planning notes so "
-        "the writer doesn't flatten them later. Decide a sensible title, introduction, section "
-        "ordering, and conclusion. Aim for approximately "
-        f"{target_section_count_min}-{target_section_count_max} sections for a conversation of this "
-        "length -- fewer is fine if the conversation genuinely covers less ground, and more is fine if "
-        "it genuinely needs it, but never split or merge sections merely to hit a number."
+        "substantially shorter, coherent, standalone EDITORIAL article -- not a transcript summary, and "
+        "not a sequence of disconnected mini-summaries. The article must be grounded in the topics "
+        "below; do not invent a section about something not covered in them.\n\n"
+        "As a loose orientation -- never a template to fill in mechanically, the transcript's own "
+        "content decides the real structure -- a well-built long-form article often moves from: the "
+        "central idea or question, to the important mechanisms/ideas behind it, to practical "
+        "implications, to complications or tensions, to personal stories or concrete examples, to "
+        "broader meaning. Use only as much of this arc as the conversation actually supports.\n\n"
+        "For EACH section, in addition to its heading and content, decide:\n"
+        "- narrative_purpose: one sentence, in your own words, explaining this section's editorial role "
+        '(e.g. "Establish the central principle that anchors the rest of the article.") -- an actual '
+        "explanation of what the section is for, not a category label.\n"
+        "- transition_from_previous: one sentence on why this section is the natural next step after "
+        "the previous one, not just the next topic on a list (leave blank for the first section).\n\n"
+        "Preserve important disagreements/contrasting viewpoints as their own planning notes so the "
+        "writer doesn't flatten them later. Decide a sensible title, introduction, section ordering, and "
+        "conclusion. The introduction should establish the central question or tension the conversation "
+        "explores and give the reader a genuine reason to keep reading -- not a biography of the "
+        "speakers unless the biography itself is directly relevant. The conclusion should return to that "
+        "central question and offer a synthesis, not a restatement of every section in order.\n\n"
+        f"Aim for approximately {target_section_count_min}-{target_section_count_max} sections for a "
+        "conversation of this length -- fewer is fine if the conversation genuinely covers less ground, "
+        "and more is fine if it genuinely needs it, but never split or merge sections merely to hit a "
+        f"number. The finished article should read at roughly {target_word_count_min}-{target_word_count_max} "
+        "words in total -- size and scope sections with that in mind, favoring one well-developed "
+        "treatment of each idea over spreading it across multiple sections that each re-explain it."
     )
     topic_lines = "\n\n".join(
         f"[topic {t.sequence_number}] {t.title}\n{t.summary}\n"
@@ -126,6 +149,14 @@ def _format_topic_note(topic: Topic) -> str:
     return "\n".join(lines)
 
 
+def _format_preceding_sections(preceding_sections_key_ideas: list[tuple[str, list[str]]]) -> str:
+    lines = []
+    for heading, ideas in preceding_sections_key_ideas:
+        idea_text = "; ".join(ideas) if ideas else "(no key ideas recorded)"
+        lines.append(f'- "{heading}": {idea_text}')
+    return "\n".join(lines)
+
+
 def section_generation_prompt(
     *,
     heading: str,
@@ -137,13 +168,21 @@ def section_generation_prompt(
     article_title: str,
     section_headings: list[str],
     current_section_number: int,
+    narrative_purpose: str = "",
+    transition_from_previous: str = "",
+    introduction_summary: str = "",
+    conclusion_summary: str = "",
+    preceding_sections_key_ideas: list[tuple[str, list[str]]] | None = None,
+    preceding_section_excerpt: str | None = None,
+    target_word_count_min: int | None = None,
+    target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
 ) -> tuple[str, str]:
     """Returns (system, user) for generating one article section.
 
-    Three kinds of material, in strictly decreasing authority -- see the
-    system prompt below and PRODUCT_SPEC.md/ARCHITECTURE.md's fidelity
-    requirements:
+    Three kinds of *evidentiary* material, in strictly decreasing
+    authority -- see the system prompt below and
+    PRODUCT_SPEC.md/ARCHITECTURE.md's fidelity requirements:
     1. `supporting_chunks` -- raw transcript excerpts. The only actual
        evidence; every claim in the generated section must trace back to
        these.
@@ -162,14 +201,26 @@ def section_generation_prompt(
     Deliberately narrow on all three: only THIS section's own supporting
     chunks and topics (never the full chunk set or the full knowledge
     layer), and only the other sections' HEADINGS (never their generated
-    prose, which doesn't exist yet when sections are generated in
-    sequence, and is never resent even during a later revision).
+    prose) reach the ARTICLE STRUCTURE block above.
+
+    Separately, for editorial coherence (not evidence): `narrative_purpose`/
+    `transition_from_previous` are this section's own planning notes;
+    `preceding_sections_key_ideas` is each EARLIER section's own planned
+    key_ideas (never full prose -- see app/ai/nodes/section_generation.py,
+    which builds this from the plan, not from the article); and
+    `preceding_section_excerpt` is a short, deterministically-truncated
+    tail of the IMMEDIATELY preceding section's actual generated content
+    (not an LLM summary -- see the same module's excerpt_preceding_section).
+    None of these carry new factual claims of their own; they exist purely
+    so this section can flow from and build on what came before instead of
+    re-explaining it.
     """
     system = (
-        "You are writing one section of a knowledge article derived from a podcast conversation. "
-        f"{FIDELITY_CONSTRAINTS}\n\n"
-        "You are given three kinds of material, in order of authority. (1) SOURCE MATERIAL -- raw "
-        "transcript excerpts; the only actual evidence, and the sole source of truth for what was "
+        "You are writing one section of a knowledge article derived from a podcast conversation. The "
+        "article as a whole should read as a coherent, engaging editorial piece -- not a collection of "
+        f"transcript summaries stitched together. {FIDELITY_CONSTRAINTS}\n\n"
+        "You are given three kinds of evidentiary material, in order of authority. (1) SOURCE MATERIAL "
+        "-- raw transcript excerpts; the only actual evidence, and the sole source of truth for what was "
         "said. (2) TOPIC NOTES -- a previously extracted summary and claims for context and "
         "attribution only; this is an interpretation layered on the excerpts, not evidence in its own "
         "right, and never outweighs the raw excerpts if the two ever seem to disagree. Where a claim's "
@@ -177,9 +228,19 @@ def section_generation_prompt(
         "from opinions, speculation, or personal anecdotes in your writing -- but only when the source "
         "excerpts actually support it. (3) ARTICLE TITLE/STRUCTURE -- purely structural, so you know "
         "this section's place in the whole piece and avoid repeating material assigned to another "
-        "section; it carries no factual content of its own. "
+        "section; it carries no factual content of its own.\n\n"
+        "You are also given editorial context (not evidence): this section's intended purpose and how "
+        "it follows the previous one, and a compact view of what earlier sections already covered. Use "
+        "this to write a natural continuation -- build on ideas already introduced rather than "
+        "re-explaining them from scratch, unless you are adding a genuinely new layer to one. Only "
+        "repeat something already covered when that new layer earns it.\n\n"
         "Write substantive, readable prose (not bullet points, not a transcript excerpt) that a reader "
-        "who never heard the podcast could understand on its own."
+        "who never heard the podcast could understand on its own. Vary how paragraphs open -- do not "
+        'repeatedly start with constructions like "X says", "X explains", or "X argues" -- and avoid '
+        'repetitive AI-style transitions such as "In conclusion", "Furthermore", "Moreover", or '
+        '"Another important aspect is". Where the transcript naturally supports it, use questions, '
+        "contrasts, concrete examples, or a brief story to give the reader a reason to keep reading -- "
+        "never invented drama, sensationalism, or fake suspense."
     )
 
     parts = [f"ARTICLE TITLE:\n{article_title}", "", "ARTICLE STRUCTURE:"]
@@ -193,10 +254,54 @@ def section_generation_prompt(
         parts.append(f"Viewpoints/disagreements to preserve: {'; '.join(viewpoints)}")
     if attribution_notes:
         parts.append(f"Attribution notes: {'; '.join(attribution_notes)}")
+    if narrative_purpose:
+        parts.append(f"This section's editorial purpose: {narrative_purpose}")
+    if transition_from_previous:
+        parts.append(f"Why this section follows the previous one: {transition_from_previous}")
+
+    is_first_section = current_section_number == 0
+    is_last_section = current_section_number == len(section_headings) - 1
+    if is_first_section and introduction_summary:
+        parts.append(
+            "\nThis is the ARTICLE'S OPENING SECTION. Beyond the key ideas above, use it to establish "
+            "the central question or tension this article explores and give the reader a genuine, "
+            "specific reason to keep reading -- not generic scene-setting, and not a biography of the "
+            "speaker(s) unless directly relevant to that central question. Set the article's narrative "
+            f"direction so later sections read as a natural continuation.\nPlanned introduction intent: "
+            f"{introduction_summary}"
+        )
+    if is_last_section and conclusion_summary:
+        parts.append(
+            "\nThis is the ARTICLE'S CLOSING SECTION. Beyond the key ideas above, use it to return to "
+            "the central question or idea the introduction raised and offer a synthesis -- do not "
+            "mechanically restate each earlier section, and do not introduce a completely new major "
+            f"topic here.\nPlanned conclusion intent: {conclusion_summary}"
+        )
+
+    if preceding_sections_key_ideas or preceding_section_excerpt:
+        already_covered_parts = [
+            "\nALREADY COVERED BY EARLIER SECTIONS (context only, not evidence -- build on these "
+            "rather than re-explaining them; repeating one is fine only if you add a genuinely new "
+            "layer to it):"
+        ]
+        if preceding_sections_key_ideas:
+            already_covered_parts.append(_format_preceding_sections(preceding_sections_key_ideas))
+        if preceding_section_excerpt:
+            already_covered_parts.append(
+                f'\nThe immediately preceding section ended with:\n"{preceding_section_excerpt}"'
+            )
+        parts.append("\n".join(already_covered_parts))
 
     if relevant_topics:
         topic_notes = "\n\n".join(_format_topic_note(t) for t in relevant_topics)
         parts.append(f"\nTOPIC NOTES (interpretation/context only -- see SOURCE MATERIAL for evidence):\n\n{topic_notes}")
+
+    if target_word_count_min and target_word_count_max:
+        parts.append(
+            f"\nThis section should run roughly {target_word_count_min}-{target_word_count_max} words "
+            "-- an approximate guide, not a hard limit; do not pad to reach it or cut a genuinely "
+            "necessary point just to stay under it."
+        )
 
     chunk_text = "\n\n".join(f"[source excerpt {i}]\n{c.text}" for i, c in enumerate(supporting_chunks))
     parts.append(f"\nSOURCE MATERIAL (the actual evidence this section must be grounded in):\n\n{chunk_text}")

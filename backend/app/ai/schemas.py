@@ -72,6 +72,30 @@ class PlannedSection(BaseModel):
     supporting_topic_sequence_numbers: list[int] = Field(default_factory=list)
     viewpoints: list[str] = Field(default_factory=list)
     attribution_notes: list[str] = Field(default_factory=list)
+    # Editorial planning notes (free text, not a rigid enum -- the
+    # transcript determines the actual structure, this just carries the
+    # planner's own reasoning forward to section_generation_prompt so a
+    # section isn't written from a heading alone). Both default to "" --
+    # backward compatible with an already-persisted ArticlePlan.sections
+    # row from before this field existed (see app/ai/nodes/section_generation.py's
+    # planned_section.get(..., "") reads) and with existing test fixtures
+    # that construct a PlannedSection without them.
+    narrative_purpose: str = Field(
+        default="",
+        description=(
+            "One sentence, in your own words, explaining this section's editorial role in the "
+            'article -- e.g. "Establish the central principle that anchors the rest of the article." '
+            "Not a category label."
+        ),
+    )
+    transition_from_previous: str = Field(
+        default="",
+        description=(
+            "One sentence explaining why this section naturally follows the previous one -- what "
+            "makes it the next step for the reader, not just the next topic on a list. Blank for the "
+            "first section."
+        ),
+    )
 
 
 class ArticlePlanResult(BaseModel):

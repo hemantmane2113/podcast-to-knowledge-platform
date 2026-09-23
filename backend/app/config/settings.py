@@ -102,7 +102,23 @@ class Settings(BaseSettings):
     # transcript's word count -- the product goal is "substantially shorter
     # than the original conversation" (see PRODUCT_SPEC.md), not a hard
     # limit: article_validation.py reports a violation, it doesn't block.
+    # This is the SAFETY maximum (retained as-is) -- article_target_word_count_*
+    # below is a separate, tighter EDITORIAL target used only as prompt
+    # guidance, not lowered into this ratio (a long, dense source transcript
+    # can legitimately still need up to this ratio; the editorial target is
+    # what generation actually aims for on an ordinary long-form episode).
     article_max_length_ratio: float = 0.4
+
+    # Soft editorial length target (prompt guidance only, app/ai/prompts.py's
+    # planning_prompt and section_generation_prompt -- never a hard
+    # constraint, never enforced by article_validation.py). Reached
+    # primarily by planning fewer/tighter sections and by giving each
+    # section enough "already covered" context (see
+    # app/ai/nodes/section_generation.py) to avoid re-explaining the same
+    # idea across sections, not by truncating generated content. Roughly a
+    # 15-30 minute read for a typical long-form episode.
+    article_target_word_count_min: int = 5500
+    article_target_word_count_max: int = 6500
 
     # Prompt guidance ONLY (app/ai/prompts.py::planning_prompt) -- the
     # planner is instructed to aim for roughly this many sections for a

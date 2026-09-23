@@ -10,7 +10,13 @@ import uuid
 from types import SimpleNamespace
 
 from app.ai.nodes.revision import _sections_needing_revision
-from app.ai.nodes.section_generation import generate_section, section_headings_by_sequence
+from app.ai.nodes.section_generation import (
+    collect_preceding_key_ideas,
+    excerpt_preceding_section,
+    generate_section,
+    section_headings_by_sequence,
+    section_word_target,
+)
 from app.ai.nodes.topic_analysis import (
     _batch_chunks,
     _boundary_candidate_indices,
@@ -18,7 +24,15 @@ from app.ai.nodes.topic_analysis import (
     _reconstruct_topics,
 )
 from app.ai.prompts import section_generation_prompt
-from app.ai.schemas import GeneratedSection, TopicClaim, TopicItem, TopicMergeDecision, TopicMergeGroup
+from app.ai.schemas import (
+    GeneratedSection,
+    PlannedSection,
+    TopicClaim,
+    TopicItem,
+    TopicMergeDecision,
+    TopicMergeGroup,
+)
+from app.config.settings import Settings
 from app.models.chunk import Chunk
 from app.models.topic import Topic
 from tests.fakes import FakeLLMProvider
@@ -705,3 +719,285 @@ def test_section_generation_prompt_never_includes_other_sections_source_text() -
     # (which were simply never given to this call) can leak in.
     assert own_chunk.text in user
     assert user.count("[source excerpt") == 1
+
+
+# --- Batch 3 (editorial rework): narrative_purpose / transition / intro-conclusion / already-covered ---
+
+
+def test_planned_section_narrative_fields_default_to_blank() -> None:
+    # Backward compatible with an already-persisted ArticlePlan.sections
+    # row from before these fields existed, and with any fixture/test that
+    # constructs a PlannedSection without them (see _planned_section above).
+    section = PlannedSection(heading="Some Section")
+    assert section.narrative_purpose == ""
+    assert section.transition_from_previous == ""
+
+
+def test_section_generation_prompt_includes_narrative_purpose_and_transition_when_given() -> None:
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle Section", "Conclusion"],
+        current_section_number=1,
+        narrative_purpose="Show the mechanism behind the central claim.",
+        transition_from_previous="Having established the claim, the reader now needs to see how it works.",
+    )
+
+    assert "Show the mechanism behind the central claim." in user
+    assert "Having established the claim, the reader now needs to see how it works." in user
+
+
+def test_section_generation_prompt_omits_narrative_fields_when_blank() -> None:
+    _, user = section_generation_prompt(
+        heading="Middle Section",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle Section", "Conclusion"],
+        current_section_number=1,
+    )
+
+    assert "editorial purpose" not in user
+    assert "follows the previous one" not in user
+
+
+def test_section_generation_prompt_adds_opening_block_only_for_first_section_with_intro_summary() -> None:
+    _, first = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=0,
+        introduction_summary="the central tension is X",
+    )
+    _, middle = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+        introduction_summary="the central tension is X",  # even if passed, must not apply mid-article
+    )
+
+    assert "ARTICLE'S OPENING SECTION" in first
+    assert "the central tension is X" in first
+    assert "ARTICLE'S OPENING SECTION" not in middle
+
+
+def test_section_generation_prompt_adds_closing_block_only_for_last_section_with_conclusion_summary() -> None:
+    _, last = section_generation_prompt(
+        heading="Conclusion",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=2,
+        conclusion_summary="return to the central question",
+    )
+    _, middle = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+        conclusion_summary="return to the central question",
+    )
+
+    assert "ARTICLE'S CLOSING SECTION" in last
+    assert "return to the central question" in last
+    assert "ARTICLE'S CLOSING SECTION" not in middle
+
+
+def test_section_generation_prompt_includes_already_covered_block_from_both_layers() -> None:
+    _, user = section_generation_prompt(
+        heading="Conclusion",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=2,
+        preceding_sections_key_ideas=[("Intro", ["idea one"]), ("Middle", ["idea two"])],
+        preceding_section_excerpt="the previous section's closing thought",
+    )
+
+    assert "ALREADY COVERED" in user
+    assert '"Intro": idea one' in user
+    assert '"Middle": idea two' in user
+    assert "the previous section's closing thought" in user
+
+
+def test_section_generation_prompt_omits_already_covered_block_when_nothing_precedes() -> None:
+    _, user = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=0,
+    )
+
+    assert "ALREADY COVERED" not in user
+
+
+def test_section_generation_prompt_includes_soft_word_target_when_given() -> None:
+    _, with_target = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+        target_word_count_min=1000,
+        target_word_count_max=1500,
+    )
+    _, without_target = section_generation_prompt(
+        heading="Middle",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=1,
+    )
+
+    assert "1000" in with_target and "1500" in with_target
+    assert "roughly" in with_target
+    assert "1000" not in without_target
+
+
+def test_collect_preceding_key_ideas_returns_only_earlier_sections_in_order() -> None:
+    ordered = [
+        {"sequence_number": 0, "heading": "Intro", "key_ideas": ["a"]},
+        {"sequence_number": 1, "heading": "Middle", "key_ideas": ["b"]},
+        {"sequence_number": 2, "heading": "Conclusion", "key_ideas": ["c"]},
+    ]
+
+    assert collect_preceding_key_ideas(ordered, 0) == []
+    assert collect_preceding_key_ideas(ordered, 1) == [("Intro", ["a"])]
+    assert collect_preceding_key_ideas(ordered, 2) == [("Intro", ["a"]), ("Middle", ["b"])]
+
+
+def test_excerpt_preceding_section_uses_the_last_paragraph() -> None:
+    content = "First paragraph, with earlier material.\n\nSecond paragraph, the actual ending."
+    assert excerpt_preceding_section(content) == "Second paragraph, the actual ending."
+
+
+def test_excerpt_preceding_section_truncates_a_long_tail_keeping_the_end() -> None:
+    long_tail = "word " * 300 + "the very last words"
+    excerpt = excerpt_preceding_section(long_tail)
+    assert excerpt.startswith("...")
+    assert excerpt.endswith("the very last words")
+    assert len(excerpt) <= 503  # "..." + 500 char budget
+
+
+def test_excerpt_preceding_section_handles_single_paragraph_content() -> None:
+    assert excerpt_preceding_section("just one paragraph, no blank-line breaks") == (
+        "just one paragraph, no blank-line breaks"
+    )
+
+
+def test_section_word_target_splits_evenly_across_sections() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="development",
+        llm_provider="groq",
+        groq_api_key="x",
+        llm_model="m",
+        article_target_word_count_min=6000,
+        article_target_word_count_max=9000,
+    )
+
+    assert section_word_target(settings, 3) == (2000, 3000)
+    assert section_word_target(settings, 0) == (None, None)
+
+
+async def test_generate_section_forwards_narrative_and_already_covered_context_to_the_prompt() -> None:
+    chunk = _chunk("raw text", 0)
+    planned_section = _planned_section(
+        sequence_number=1,
+        heading="Body",
+        supporting_chunk_ids=[chunk.id],
+        supporting_topic_ids=[],
+    )
+    planned_section["narrative_purpose"] = "Show the mechanism."
+    planned_section["transition_from_previous"] = "Because the claim was just established."
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[GeneratedSection(heading="Body", content="prose")]
+        )
+    )
+
+    await generate_section(
+        deps,
+        planned_section,
+        {chunk.id: chunk},
+        {},
+        article_title="T",
+        section_headings=["Intro", "Body", "Conclusion"],
+        preceding_sections_key_ideas=[("Intro", ["idea one"])],
+        preceding_section_excerpt="how the intro ended",
+        target_word_count_min=500,
+        target_word_count_max=800,
+    )
+
+    messages, system, _ = deps.llm_provider.structured_calls[0]
+    prompt_text = system + messages[0].content
+    assert "Show the mechanism." in prompt_text
+    assert "Because the claim was just established." in prompt_text
+    assert "idea one" in prompt_text
+    assert "how the intro ended" in prompt_text
+    assert "500" in prompt_text and "800" in prompt_text
+
+
+async def test_generate_section_omits_narrative_fields_absent_from_planned_section_dict() -> None:
+    """A planned_section dict that predates narrative_purpose/
+    transition_from_previous (e.g. an ArticlePlan persisted before this
+    fix, or an old-style test fixture) must not raise -- .get(..., "")."""
+    chunk = _chunk("raw text", 0)
+    planned_section = _planned_section(
+        sequence_number=0, heading="Intro", supporting_chunk_ids=[chunk.id], supporting_topic_ids=[]
+    )
+    assert "narrative_purpose" not in planned_section  # confirms the premise
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[GeneratedSection(heading="Intro", content="prose")]
+        )
+    )
+
+    await generate_section(  # must not raise
+        deps, planned_section, {chunk.id: chunk}, {}, article_title="T", section_headings=["Intro"]
+    )

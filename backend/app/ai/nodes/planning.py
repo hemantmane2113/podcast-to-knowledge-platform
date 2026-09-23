@@ -53,6 +53,8 @@ def build(deps: PipelineDeps):
             topics,
             target_section_count_min=deps.settings.section_count_target_min,
             target_section_count_max=deps.settings.section_count_target_max,
+            target_word_count_min=deps.settings.article_target_word_count_min,
+            target_word_count_max=deps.settings.article_target_word_count_max,
         )
         result: ArticlePlanResult = await deps.llm_provider.generate_structured(
             messages=[LLMMessage(role="user", content=user)],
@@ -83,6 +85,8 @@ def build(deps: PipelineDeps):
                     supporting_chunk_ids=supporting_chunk_ids,
                     viewpoints=section.viewpoints,
                     attribution_notes=section.attribution_notes,
+                    narrative_purpose=section.narrative_purpose,
+                    transition_from_previous=section.transition_from_previous,
                 )
             )
 

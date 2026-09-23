@@ -188,6 +188,128 @@ async def test_pipeline_stops_after_max_revision_attempts_even_if_still_failing(
     assert final_state["revision_count"] == 2  # stopped at the bound, not looping forever
 
 
+async def test_pipeline_passes_narrative_context_and_already_covered_material_to_later_sections(
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end proof of the editorial-rework wiring (Batch 3): a real
+    planning_node -> section_generation_node round-trip through actual
+    Postgres persistence (not just section_generation_prompt in
+    isolation) must carry narrative_purpose/transition_from_previous,
+    introduction_summary/conclusion_summary, and both "already covered"
+    layers (planned key_ideas + the immediately preceding section's own
+    generated tail) into each later section's actual prompt -- and must
+    NOT leak a non-immediate section's content (only the immediately
+    preceding one)."""
+    episode, transcript = await _seed(db_session)
+    chunks = _chunks()
+
+    def _section_content(tail_marker: str) -> str:
+        # Distinct lead text per section (not just the tail) -- identical
+        # filler paragraphs across sections would otherwise legitimately
+        # trip check_no_duplicate_paragraphs and force an unplanned
+        # revision round this test isn't set up for.
+        return f"Lead paragraph {tail_marker}. " + " ".join(["word"] * 140) + f"\n\nClosing thought {tail_marker}."
+
+    llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
+            ArticlePlanResult(
+                title="The Article",
+                introduction_summary="central question X",
+                sections=[
+                    PlannedSection(
+                        heading="Intro",
+                        key_ideas=["idea A"],
+                        supporting_topic_sequence_numbers=[0],
+                        narrative_purpose="purpose A",
+                        transition_from_previous="",
+                    ),
+                    PlannedSection(
+                        heading="Body",
+                        key_ideas=["idea B"],
+                        supporting_topic_sequence_numbers=[0],
+                        narrative_purpose="purpose B",
+                        transition_from_previous="because of A",
+                    ),
+                    PlannedSection(
+                        heading="Conclusion",
+                        key_ideas=["idea C"],
+                        supporting_topic_sequence_numbers=[0],
+                        narrative_purpose="purpose C",
+                        transition_from_previous="because of B",
+                    ),
+                ],
+                conclusion_summary="synthesis Y",
+            ),
+            GeneratedSection(heading="Intro", content=_section_content("TAIL0")),
+            GeneratedSection(heading="Body", content=_section_content("TAIL1")),
+            GeneratedSection(heading="Conclusion", content=_section_content("TAIL2")),
+        ]
+    )
+    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings(section_count_min=1))
+
+    initial_state: ArticlePipelineState = {
+        "episode_id": episode.id,
+        "transcript_id": transcript.id,
+        "chunks": chunks,
+        "transcript_word_count": 100_000,
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+
+    final_state = await run_article_pipeline(deps, initial_state)
+    assert final_state["validation_report"].passed
+
+    # The persisted plan itself carries the new fields through planning_node.
+    plan_sections = final_state["plan"].sections
+    assert plan_sections[1]["narrative_purpose"] == "purpose B"
+    assert plan_sections[1]["transition_from_previous"] == "because of A"
+
+    # structured_calls: [0]=topic_analysis, [1]=planning, [2..4]=sections 0,1,2.
+    def _prompt_text(index: int) -> str:
+        messages, system, _ = llm.structured_calls[index]
+        return system + messages[0].content
+
+    intro_prompt = _prompt_text(2)
+    body_prompt = _prompt_text(3)
+    conclusion_prompt = _prompt_text(4)
+
+    # Section 0 (opening): gets the introduction-specific block, and has
+    # no "already covered" block at all (nothing precedes it).
+    assert "ARTICLE'S OPENING SECTION" in intro_prompt
+    assert "central question X" in intro_prompt
+    assert "ALREADY COVERED" not in intro_prompt
+
+    # Section 1 (middle): gets its own narrative_purpose/transition, layer-1
+    # context from section 0's PLANNED key idea, and layer-2 context from
+    # section 0's ACTUAL generated tail -- but nothing from section 2
+    # (which doesn't exist yet), and no intro/conclusion block.
+    assert "purpose B" in body_prompt
+    assert "because of A" in body_prompt
+    assert "idea A" in body_prompt
+    assert "Closing thought TAIL0" in body_prompt
+    assert "idea C" not in body_prompt
+    assert "ARTICLE'S OPENING SECTION" not in body_prompt
+    assert "ARTICLE'S CLOSING SECTION" not in body_prompt
+
+    # Section 2 (closing): gets the conclusion-specific block, layer-1
+    # context from BOTH earlier sections' planned key ideas, but layer-2
+    # context ONLY from section 1's tail -- section 0's tail must not leak
+    # through (only the immediately preceding section's excerpt is passed).
+    assert "ARTICLE'S CLOSING SECTION" in conclusion_prompt
+    assert "synthesis Y" in conclusion_prompt
+    assert "idea A" in conclusion_prompt
+    assert "idea B" in conclusion_prompt
+    assert "Closing thought TAIL1" in conclusion_prompt
+    assert "Closing thought TAIL0" not in conclusion_prompt
+
+    # Soft per-section word-count guidance derived from
+    # Settings.article_target_word_count_min/max (defaults 5500/6500) split
+    # across 3 planned sections.
+    assert "1833" in body_prompt
+    assert "2166" in body_prompt
+
+
 async def test_topic_analysis_batches_when_chunks_exceed_token_budget(db_session: AsyncSession) -> None:
     episode, transcript = await _seed(db_session)
     chunks = _chunks()  # 2 chunks, ~50 tokens each (200 words / 4)

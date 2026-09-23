@@ -86,6 +86,8 @@ async def test_article_plan_replace_persists_sections(db_session: AsyncSession) 
             supporting_topic_ids=[str(uuid.uuid4())],
             supporting_chunk_ids=[str(uuid.uuid4())],
             viewpoints=["host thinks X"],
+            narrative_purpose="Establish the central principle.",
+            transition_from_previous="",
         )
     ]
     await repo.replace(
@@ -102,6 +104,35 @@ async def test_article_plan_replace_persists_sections(db_session: AsyncSession) 
     assert stored.title == "The Article"
     assert stored.sections[0]["heading"] == "Introduction"
     assert stored.sections[0]["key_ideas"] == ["idea one"]
+    assert stored.sections[0]["narrative_purpose"] == "Establish the central principle."
+    assert stored.sections[0]["transition_from_previous"] == ""
+
+
+async def test_article_plan_replace_defaults_narrative_fields_to_blank(db_session: AsyncSession) -> None:
+    """A PlannedSectionData built without the two new fields (e.g. older
+    call-site code, or a test fixture written before this change) must
+    still persist cleanly -- backward-compatible defaults, not a required
+    field."""
+    episode, _ = await _seed_episode_and_transcript(db_session)
+    repo = ArticlePlanRepository(db_session)
+
+    sections = [
+        PlannedSectionData(
+            sequence_number=0,
+            heading="Introduction",
+            key_ideas=[],
+            supporting_topic_ids=[],
+            supporting_chunk_ids=[],
+        )
+    ]
+    await repo.replace(
+        episode_id=episode.id, title="T", introduction_summary="i", conclusion_summary="c", sections=sections
+    )
+    await db_session.commit()
+
+    stored = await repo.get_by_episode_id(episode.id)
+    assert stored.sections[0]["narrative_purpose"] == ""
+    assert stored.sections[0]["transition_from_previous"] == ""
 
 
 async def test_article_plan_replace_cascades_to_existing_article(db_session: AsyncSession) -> None:
