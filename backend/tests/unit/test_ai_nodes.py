@@ -9,6 +9,7 @@ budget, or a check whose details mention two different sections).
 import uuid
 from types import SimpleNamespace
 
+from app.ai.graph import _should_revise
 from app.ai.nodes.revision import _sections_needing_revision
 from app.ai.nodes.section_generation import (
     collect_preceding_key_ideas,
@@ -24,10 +25,13 @@ from app.ai.nodes.topic_analysis import (
     _merge_topics,
     _reconstruct_topics,
 )
-from app.ai.prompts import section_generation_prompt
+from app.ai.nodes.validation import _editorial_review
+from app.ai.prompts import article_editorial_review_prompt, section_generation_prompt
 from app.ai.schemas import (
+    ArticleEditorialReview,
     GeneratedSection,
     PlannedSection,
+    SectionEditorialFeedback,
     TopicClaim,
     TopicItem,
     TopicMergeDecision,
@@ -36,6 +40,7 @@ from app.ai.schemas import (
 from app.config.settings import Settings
 from app.models.chunk import Chunk
 from app.models.topic import Topic
+from app.services.article_validation import CheckResult, ValidationReport
 from tests.fakes import FakeLLMProvider
 
 
@@ -1118,3 +1123,170 @@ async def test_generate_section_omits_narrative_fields_absent_from_planned_secti
     await generate_section(  # must not raise
         deps, planned_section, {chunk.id: chunk}, {}, article_title="T", section_headings=["Intro"]
     )
+
+
+# --- Batch 5 (editorial revision/compression): _should_revise, the editorial review call, and its prompt ---
+
+
+def _passed_report() -> ValidationReport:
+    return ValidationReport(checks=[CheckResult(name="x", passed=True, details="ok")])
+
+
+def _failed_report() -> ValidationReport:
+    return ValidationReport(checks=[CheckResult(name="x", passed=False, details="bad")])
+
+
+def test_should_revise_ends_when_deterministic_passes_and_no_editorial_review_ran() -> None:
+    state = {"validation_report": _passed_report(), "revision_count": 0, "max_revision_attempts": 2}
+    assert _should_revise(state) == "end"
+
+
+def test_should_revise_ends_when_editorial_review_flags_nothing() -> None:
+    """The core "don't unnecessarily rewrite an already-good article"
+    guarantee: an editorial review with an empty sections_needing_revision
+    must not trigger a revision round on its own."""
+    state = {
+        "validation_report": _passed_report(),
+        "editorial_review": ArticleEditorialReview(coherent=True, notes="reads well", sections_needing_revision=[]),
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+    assert _should_revise(state) == "end"
+
+
+def test_should_revise_revises_when_editorial_review_flags_a_section_even_though_deterministic_passed() -> None:
+    """The core new capability: an editorial-only finding (all deterministic
+    checks pass) must still be able to trigger revision -- this is the
+    only way requirement #1's article-level problems (cross-section
+    repetition, weak transitions, ...) can ever actually reach the
+    revision mechanism, since no deterministic check detects them."""
+    state = {
+        "validation_report": _passed_report(),
+        "editorial_review": ArticleEditorialReview(
+            coherent=False,
+            notes="section 1 repeats section 0",
+            sections_needing_revision=[SectionEditorialFeedback(sequence_number=1, feedback="trim the repeat")],
+        ),
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+    assert _should_revise(state) == "revise"
+
+
+def test_should_revise_revises_on_deterministic_failure_regardless_of_editorial_review() -> None:
+    """Unchanged existing behavior: a deterministic failure alone is still
+    sufficient, exactly as before this change."""
+    state = {"validation_report": _failed_report(), "revision_count": 0, "max_revision_attempts": 2}
+    assert _should_revise(state) == "revise"
+
+
+def test_should_revise_ends_once_revision_attempts_are_exhausted_even_with_editorial_flags() -> None:
+    state = {
+        "validation_report": _passed_report(),
+        "editorial_review": ArticleEditorialReview(
+            coherent=False,
+            notes="still an issue",
+            sections_needing_revision=[SectionEditorialFeedback(sequence_number=0, feedback="fix it")],
+        ),
+        "revision_count": 2,
+        "max_revision_attempts": 2,
+    }
+    assert _should_revise(state) == "end"
+
+
+def test_article_editorial_review_prompt_includes_sections_and_length_context() -> None:
+    _, user = article_editorial_review_prompt(
+        article_title="The Article",
+        sections=[
+            {"sequence_number": 0, "heading": "Intro", "content": "intro body text"},
+            {"sequence_number": 1, "heading": "Body", "content": "body content text"},
+        ],
+        article_word_count=8000,
+        target_word_count_min=5500,
+        target_word_count_max=6500,
+    )
+
+    assert "The Article" in user
+    assert "Section 0: Intro" in user
+    assert "intro body text" in user
+    assert "Section 1: Body" in user
+    assert "body content text" in user
+    assert "8000" in user
+    assert "5500" in user and "6500" in user
+
+
+def test_article_editorial_review_prompt_never_passes_the_full_transcript() -> None:
+    """Structural proof: the only thing this function can ever put in the
+    prompt is what's passed in `sections` -- there is no parameter through
+    which the raw transcript or a chunk's own text could reach it."""
+    _, user = article_editorial_review_prompt(
+        article_title="T",
+        sections=[{"sequence_number": 0, "heading": "Intro", "content": "the only content"}],
+        article_word_count=10,
+        target_word_count_min=5,
+        target_word_count_max=20,
+    )
+    assert user.count("## Section") == 1
+
+
+def test_article_editorial_review_prompt_instructs_against_uniform_shortening_and_invented_facts() -> None:
+    system, _ = article_editorial_review_prompt(
+        article_title="T",
+        sections=[],
+        article_word_count=100,
+        target_word_count_min=50,
+        target_word_count_max=80,
+    )
+
+    assert "uniformly shortened" in system
+    assert "never suggest adding, removing, or changing a fact" in system.lower()
+    assert "qualification" in system and "disagreement" in system
+
+
+async def test_editorial_review_returns_none_when_disabled_and_never_calls_the_llm() -> None:
+    deps = SimpleNamespace(
+        settings=Settings(
+            _env_file=None, app_env="development", llm_provider="groq", groq_api_key="x", llm_model="m"
+        ),  # enable_llm_validation defaults to False
+        llm_provider=FakeLLMProvider(structured_responses=[]),  # must never be consumed
+    )
+    article = SimpleNamespace(title="T", sections=[])
+
+    result = await _editorial_review(deps, article)
+
+    assert result is None
+    assert deps.llm_provider.structured_calls == []
+
+
+async def test_editorial_review_calls_the_llm_and_returns_the_structured_result_when_enabled() -> None:
+    review = ArticleEditorialReview(
+        coherent=False,
+        notes="repeats itself",
+        sections_needing_revision=[SectionEditorialFeedback(sequence_number=1, feedback="trim this")],
+    )
+    deps = SimpleNamespace(
+        settings=Settings(
+            _env_file=None,
+            app_env="development",
+            llm_provider="groq",
+            groq_api_key="x",
+            llm_model="m",
+            enable_llm_validation=True,
+            article_target_word_count_min=100,
+            article_target_word_count_max=200,
+        ),
+        llm_provider=FakeLLMProvider(structured_responses=[review]),
+    )
+    section_a = SimpleNamespace(sequence_number=0, heading="Intro", content="intro content here")
+    section_b = SimpleNamespace(sequence_number=1, heading="Body", content="body content here")
+    article = SimpleNamespace(title="The Article", sections=[section_a, section_b])
+
+    result = await _editorial_review(deps, article)
+
+    assert result is review
+    messages, system, response_model = deps.llm_provider.structured_calls[0]
+    assert response_model is ArticleEditorialReview
+    prompt_text = system + messages[0].content
+    assert "The Article" in prompt_text
+    assert "intro content here" in prompt_text
+    assert "body content here" in prompt_text

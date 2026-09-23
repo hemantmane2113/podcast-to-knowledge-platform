@@ -12,9 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.graph import run_article_pipeline
 from app.ai.schemas import (
+    ArticleEditorialReview,
     ArticlePlanResult,
     GeneratedSection,
     PlannedSection,
+    SectionEditorialFeedback,
     TopicAnalysisResult,
     TopicItem,
     TopicMergeDecision,
@@ -356,3 +358,254 @@ async def test_topic_analysis_batches_when_chunks_exceed_token_budget(db_session
 
     assert len(final_state["topics"]) == 2
     assert {t.title for t in final_state["topics"]} == {"Batch 0", "Batch 1"}
+
+
+# --- Batch 5 (editorial revision/compression): the optional whole-article
+# editorial review driving the SAME revision mechanism end-to-end, with
+# real Postgres persistence, proving the two things this batch exists for:
+# (1) an editorial-only finding can surgically target one section while an
+# untouched section's content AND provenance survive a revision round
+# unchanged, and (2) a deterministic failure with no section-specific
+# detail (check_article_length) no longer forces every section to be
+# blindly regenerated once the editorial review also names sections.
+# ---
+
+
+def _two_section_plan() -> ArticlePlanResult:
+    return ArticlePlanResult(
+        title="The Article",
+        introduction_summary="i",
+        sections=[
+            PlannedSection(heading="Intro", supporting_topic_sequence_numbers=[0]),
+            PlannedSection(heading="Body", supporting_topic_sequence_numbers=[0]),
+        ],
+        conclusion_summary="c",
+    )
+
+
+async def test_editorial_review_targets_only_flagged_sections_and_preserves_provenance(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript = await _seed(db_session)
+    chunks = _chunks()
+
+    intro_content = "Intro opening thought. " + " ".join(["word"] * 148)
+    body_content = "Body opening thought. " + " ".join(["filler"] * 148)
+    revised_body_content = "Body revised thought. " + " ".join(["trimmed"] * 148)
+
+    llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
+            _two_section_plan(),
+            GeneratedSection(heading="Intro", content=intro_content),
+            GeneratedSection(heading="Body", content=body_content),
+            # First validation pass: deterministic checks pass (nothing
+            # section-specific to fix), but the editorial review flags
+            # section 1 (Body) on its own -- the only way an article-level
+            # finding like cross-section repetition can ever reach
+            # revision, since no deterministic check looks for it.
+            ArticleEditorialReview(
+                coherent=False,
+                notes="Body re-explains Intro's point from scratch",
+                sections_needing_revision=[
+                    SectionEditorialFeedback(sequence_number=1, feedback="don't re-explain, add a new angle")
+                ],
+            ),
+            GeneratedSection(heading="Body", content=revised_body_content),
+            # Second validation pass (after revision): editorial review now
+            # finds nothing wrong -> loop ends.
+            ArticleEditorialReview(coherent=True, notes="reads well now", sections_needing_revision=[]),
+        ]
+    )
+    deps = PipelineDeps(
+        session=db_session, llm_provider=llm, settings=_settings(section_count_min=1, enable_llm_validation=True)
+    )
+
+    initial_state: ArticlePipelineState = {
+        "episode_id": episode.id,
+        "transcript_id": transcript.id,
+        "chunks": chunks,
+        "transcript_word_count": 100_000,  # keeps article_length trivially satisfied
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+
+    final_state = await run_article_pipeline(deps, initial_state)
+
+    assert final_state["validation_report"].passed
+    assert final_state["revision_count"] == 1
+
+    sections_by_seq = {s.sequence_number: s for s in final_state["article"].sections}
+    # Section 0 (Intro) was never targeted -- content AND provenance must
+    # survive the revision round completely untouched.
+    assert sections_by_seq[0].content == intro_content
+    # Section 1 (Body) was the only one regenerated.
+    assert sections_by_seq[1].content == revised_body_content
+
+    # Provenance: both sections trace back to the same planned topic's
+    # chunks (both chunk 0 and chunk 1 of the single seeded topic) --
+    # regenerating section 1 through the revision path must not lose or
+    # alter its supporting_chunk_ids/supporting_topic_ids, which come from
+    # the immutable planned-section dict, never from the model's own
+    # output (GeneratedSection only ever carries heading/content).
+    assert len(sections_by_seq[0].supporting_chunk_ids) == 2
+    assert sections_by_seq[1].supporting_chunk_ids == sections_by_seq[0].supporting_chunk_ids
+    assert sections_by_seq[1].supporting_topic_ids == sections_by_seq[0].supporting_topic_ids
+    assert len(sections_by_seq[1].supporting_topic_ids) == 1
+
+
+async def test_editorial_review_prevents_uniform_regeneration_on_a_section_less_deterministic_failure(
+    db_session: AsyncSession,
+) -> None:
+    """Regression test for the "uniform shortening" bug: check_article_length
+    fails with no section-specific detail text (app/services/
+    article_validation.py::check_article_length never names a section), so
+    before this batch _sections_needing_revision's `targeted` set stayed
+    empty and revision.py fell back to `regenerate_all = True` -- silently
+    regenerating every section, including ones with nothing wrong with
+    them. Now the editorial review's own targeting is merged in BEFORE
+    that fallback is computed, so a length failure alongside a specific
+    editorial finding must regenerate ONLY the flagged section.
+
+    The FakeLLMProvider is programmed with exactly one structured response
+    per expected call; if `regenerate_all` were still True, the revision
+    node would also try to regenerate the untouched section and the fake
+    provider would raise (out of programmed responses) instead of the
+    assertions below ever running.
+    """
+    episode, transcript = await _seed(db_session)
+    chunks = _chunks()
+
+    intro_content = "Intro opening thought. " + " ".join(["word"] * 148)  # 150 words
+    body_content = "Body opening thought. " + " ".join(["filler"] * 148)  # 150 words
+    # Revised, but only cosmetically -- still 150 words, so the article
+    # stays over the length ceiling after this revision round. The point
+    # of this test is surgical targeting, not that length gets fixed.
+    revised_body_content = "Body trimmed thought. " + " ".join(["short"] * 148)
+
+    llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
+            _two_section_plan(),
+            GeneratedSection(heading="Intro", content=intro_content),
+            GeneratedSection(heading="Body", content=body_content),
+            # First validation pass: article is 300 words against a
+            # transcript_word_count of 500 -> 60% > the 40% ratio ceiling,
+            # so check_article_length fails with NO section number in its
+            # details. The editorial review independently names section 1.
+            ArticleEditorialReview(
+                coherent=False,
+                notes="Body is padded and could be tightened",
+                sections_needing_revision=[
+                    SectionEditorialFeedback(sequence_number=1, feedback="cut the padding")
+                ],
+            ),
+            GeneratedSection(heading="Body", content=revised_body_content),
+            # Second validation pass: still over length (only one section
+            # shrank), but revision_count(1) >= max_revision_attempts(1)
+            # stops the loop regardless of this call's content.
+            ArticleEditorialReview(coherent=False, notes="still long", sections_needing_revision=[]),
+        ]
+    )
+    deps = PipelineDeps(
+        session=db_session,
+        llm_provider=llm,
+        settings=_settings(section_count_min=1, enable_llm_validation=True, max_revision_attempts=1),
+    )
+
+    initial_state: ArticlePipelineState = {
+        "episode_id": episode.id,
+        "transcript_id": transcript.id,
+        "chunks": chunks,
+        "transcript_word_count": 500,
+        "revision_count": 0,
+        "max_revision_attempts": 1,
+    }
+
+    final_state = await run_article_pipeline(deps, initial_state)
+
+    assert not final_state["validation_report"].passed  # still over length
+    assert final_state["revision_count"] == 1
+
+    sections_by_seq = {s.sequence_number: s for s in final_state["article"].sections}
+    # The proof: section 0 (Intro), never named by the editorial review,
+    # survived the revision round with its original content intact --
+    # regenerate_all never fired despite the section-less length failure.
+    assert sections_by_seq[0].content == intro_content
+    assert sections_by_seq[1].content == revised_body_content
+
+
+async def test_editorial_review_flagging_nothing_does_not_trigger_an_unnecessary_revision(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript = await _seed(db_session)
+    chunks = _chunks()
+
+    llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
+            _two_section_plan(),
+            GeneratedSection(heading="Intro", content="Intro opening. " + " ".join(["word"] * 148)),
+            GeneratedSection(heading="Body", content="Body opening. " + " ".join(["filler"] * 148)),
+            # Deterministic checks pass, and the editorial review finds
+            # nothing wrong either -> the loop must end after exactly one
+            # editorial review call, with zero revision rounds.
+            ArticleEditorialReview(coherent=True, notes="reads well", sections_needing_revision=[]),
+        ]
+    )
+    deps = PipelineDeps(
+        session=db_session, llm_provider=llm, settings=_settings(section_count_min=1, enable_llm_validation=True)
+    )
+
+    initial_state: ArticlePipelineState = {
+        "episode_id": episode.id,
+        "transcript_id": transcript.id,
+        "chunks": chunks,
+        "transcript_word_count": 100_000,
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+
+    final_state = await run_article_pipeline(deps, initial_state)
+
+    assert final_state["validation_report"].passed
+    assert final_state.get("revision_count", 0) == 0
+    assert final_state["editorial_review"].coherent is True
+
+
+async def test_editorial_review_disabled_by_default_adds_no_llm_call_and_no_editorial_state(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript = await _seed(db_session)
+    chunks = _chunks()
+
+    llm = FakeLLMProvider(
+        structured_responses=[
+            TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
+            _two_section_plan(),
+            GeneratedSection(heading="Intro", content="Intro opening. " + " ".join(["word"] * 148)),
+            GeneratedSection(heading="Body", content="Body opening. " + " ".join(["filler"] * 148)),
+            # Deliberately NO editorial-review response programmed --
+            # enable_llm_validation defaults to False, so _editorial_review
+            # must return None without ever calling generate_structured.
+            # If it did, FakeLLMProvider would raise "ran out of
+            # programmed structured responses" and this test would fail.
+        ]
+    )
+    deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings(section_count_min=1))
+
+    initial_state: ArticlePipelineState = {
+        "episode_id": episode.id,
+        "transcript_id": transcript.id,
+        "chunks": chunks,
+        "transcript_word_count": 100_000,
+        "revision_count": 0,
+        "max_revision_attempts": 2,
+    }
+
+    final_state = await run_article_pipeline(deps, initial_state)
+
+    assert final_state["validation_report"].passed
+    assert final_state.get("revision_count", 0) == 0
+    assert final_state.get("editorial_review") is None
+    assert len(llm.structured_calls) == 4  # topic_analysis, planning, 2 sections -- no editorial call

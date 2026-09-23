@@ -6,11 +6,17 @@ decision.
 
     chunks -> topic_analysis -> planning -> section_generation -> validation
                                                                         |
-                                                        passed? --no--> revision -> (back to validation)
-                                                                        |
-                                                                       yes
+                                            deterministic failure, or --no--> revision -> (back to validation)
+                                            editorial review flagged                |
+                                            a section? (see _should_revise)        yes
                                                                         |
                                                                        END
+
+"validation" runs deterministic checks (always) and an optional
+whole-article editorial review (Settings.enable_llm_validation, off by
+default) that can independently route back into the SAME "revision" step
+a deterministic failure already uses -- see app/ai/nodes/validation.py
+and app/ai/schemas.py::ArticleEditorialReview for the full design.
 
 No checkpointer is configured (see app/ai/state.py's docstring) -- this
 compiles to a plain in-process graph for one arq job invocation.
@@ -26,7 +32,17 @@ from app.ai.state import ArticlePipelineState, PipelineDeps
 
 def _should_revise(state: ArticlePipelineState) -> Literal["revise", "end"]:
     report = state["validation_report"]
-    if report.passed:
+    # Two INDEPENDENT triggers for the same revision step (Batch 5):
+    # deterministic failure (report.passed, unchanged) and a whole-article
+    # editorial review flagging specific sections (optional,
+    # Settings.enable_llm_validation -- see app/ai/nodes/validation.py).
+    # An editorial review with no flagged sections (nothing wrong, or the
+    # feature is off/failed) never triggers this on its own -- "the article
+    # is already good, don't unnecessarily rewrite it" falls straight out
+    # of sections_needing_revision simply being empty.
+    editorial_review = state.get("editorial_review")
+    needs_editorial_revision = bool(editorial_review and editorial_review.sections_needing_revision)
+    if report.passed and not needs_editorial_revision:
         return "end"
     if state.get("revision_count", 0) >= state.get("max_revision_attempts", 2):
         return "end"

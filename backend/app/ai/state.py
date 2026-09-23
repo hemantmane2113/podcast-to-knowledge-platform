@@ -13,6 +13,7 @@ from typing import TypedDict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.schemas import ArticleEditorialReview
 from app.config.settings import Settings
 from app.models.article import Article
 from app.models.article_plan import ArticlePlan
@@ -55,6 +56,12 @@ class ArticlePipelineState(TypedDict, total=False):
     plan: ArticlePlan
     article: Article
     validation_report: ValidationReport
+    # None when Settings.enable_llm_validation is off (the default), or the
+    # optional review call failed -- see app/ai/nodes/validation.py. Its
+    # sections_needing_revision/overall_feedback are a second, independent
+    # trigger _should_revise (app/ai/graph.py) checks alongside
+    # validation_report.passed; its coherent/notes stay advisory-only.
+    editorial_review: ArticleEditorialReview | None
 
     revision_count: int
     max_revision_attempts: int

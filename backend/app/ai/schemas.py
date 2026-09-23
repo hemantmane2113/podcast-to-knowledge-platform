@@ -110,10 +110,42 @@ class GeneratedSection(BaseModel):
     content: str
 
 
-class LLMCoherenceReview(BaseModel):
-    """Optional, supplementary LLM-based check (Settings.enable_llm_validation)
-    -- never folds into ValidationReport.passed (app/services/article_validation.py
-    stays entirely deterministic); see app/ai/nodes/validation.py."""
+class SectionEditorialFeedback(BaseModel):
+    """One section the whole-article editorial review (Batch 5) has
+    identified a genuine article-level problem with -- cross-section
+    repetition, a weak transition, disproportionate length, an
+    under/over-explained idea, and so on. `feedback` must be specific
+    enough for app/ai/nodes/revision.py to hand straight to
+    generate_section() as revision_feedback, the same way a failed
+    deterministic check's own detail text already is."""
+
+    sequence_number: int
+    feedback: str
+
+
+class ArticleEditorialReview(BaseModel):
+    """Optional, whole-article editorial review (Settings.enable_llm_validation)
+    -- reads the ASSEMBLED article (never the raw transcript, never a new
+    retrieval mechanism) to catch what section-by-section generation
+    structurally cannot see: repetition between non-adjacent sections, weak
+    transitions, disproportionate section length, an introduction that
+    doesn't establish the central question, a conclusion that just
+    repeats, and where the soft word-count target calls for tightening
+    rather than uniform shortening (app/ai/prompts.py::article_editorial_review_prompt
+    has the exact instructions).
+
+    `coherent`/`notes` remain purely advisory, exactly as the prior
+    LLMCoherenceReview -- appended to the persisted `checks` for a human
+    reviewer, never folded into ValidationReport.passed
+    (app/services/article_validation.py stays entirely deterministic).
+    `sections_needing_revision`/`overall_feedback` are the new, ACTIONABLE
+    part: app/ai/graph.py's _should_revise and app/ai/nodes/revision.py
+    read them to target the SAME existing per-section revision mechanism a
+    failed deterministic check already uses -- this review never rewrites
+    anything itself, it only decides what needs another look and why.
+    """
 
     coherent: bool
     notes: str
+    sections_needing_revision: list[SectionEditorialFeedback] = Field(default_factory=list)
+    overall_feedback: str = ""

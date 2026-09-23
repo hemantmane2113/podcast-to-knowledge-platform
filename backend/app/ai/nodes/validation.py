@@ -1,14 +1,29 @@
 """Phase H: validation. Deterministic checks (app/services/article_validation.py)
-are the source of truth for pass/fail; an optional LLM coherence review
-(Settings.enable_llm_validation, off by default) is appended to the
-persisted `checks` list purely as supplementary information and never
-affects ValidationReport.passed -- "never a replacement for the
-deterministic checks."""
+are the source of truth for pass/fail -- ValidationReport.passed stays
+entirely deterministic, always.
+
+Separately, an optional whole-article editorial review
+(Settings.enable_llm_validation, off by default) reads the ASSEMBLED
+article to catch what per-section generation structurally cannot see:
+cross-section repetition, weak transitions, a soft-target overshoot that
+calls for targeted tightening rather than uniform shortening, and so on
+(app/ai/prompts.py::article_editorial_review_prompt has the exact
+instructions; app/ai/schemas.py::ArticleEditorialReview docstring has the
+full design). Its `coherent`/`notes` stay purely advisory, appended to the
+persisted `checks` exactly as the prior LLMCoherenceReview was -- never
+folded into ValidationReport.passed. Its `sections_needing_revision`/
+`overall_feedback` are new and ACTIONABLE: returned separately as
+`editorial_review` in pipeline state, read by app/ai/graph.py's
+_should_revise and app/ai/nodes/revision.py to route into the SAME
+existing per-section revision mechanism a failed deterministic check
+already uses -- a second, independent trigger for revision, never a
+change to what "passed" means.
+"""
 
 import logging
 
-from app.ai.prompts import llm_coherence_review_prompt
-from app.ai.schemas import LLMCoherenceReview
+from app.ai.prompts import article_editorial_review_prompt
+from app.ai.schemas import ArticleEditorialReview
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.core.exceptions import LLMProviderError
 from app.models.episode import ProcessingStatus
@@ -18,22 +33,33 @@ from app.services.article_validation import run_validation
 logger = logging.getLogger(__name__)
 
 
-async def _optional_llm_review(deps: PipelineDeps, article) -> dict | None:
+async def _editorial_review(deps: PipelineDeps, article) -> ArticleEditorialReview | None:
     if not deps.settings.enable_llm_validation:
         return None
-    article_text = "\n\n".join(f"## {s.heading}\n\n{s.content}" for s in article.sections)
-    system, user = llm_coherence_review_prompt(article_text)
+    sections = [
+        {"sequence_number": s.sequence_number, "heading": s.heading, "content": s.content}
+        for s in article.sections
+    ]
+    article_word_count = sum(len(s.content.split()) for s in article.sections)
+    system, user = article_editorial_review_prompt(
+        article_title=article.title,
+        sections=sections,
+        article_word_count=article_word_count,
+        target_word_count_min=deps.settings.article_target_word_count_min,
+        target_word_count_max=deps.settings.article_target_word_count_max,
+    )
     try:
-        review: LLMCoherenceReview = await deps.llm_provider.generate_structured(
+        return await deps.llm_provider.generate_structured(
             messages=[LLMMessage(role="user", content=user)],
             system=system,
-            response_model=LLMCoherenceReview,
+            response_model=ArticleEditorialReview,
         )
     except LLMProviderError as exc:
-        # Supplementary only -- never fails the pipeline on its own.
-        logger.warning("Optional LLM coherence review failed (non-fatal): %s", exc)
+        # Optional in every sense -- never fails the pipeline on its own,
+        # and a failed call simply means no editorial-review-driven
+        # revision this round, same as if it were disabled.
+        logger.warning("Optional article editorial review failed (non-fatal): %s", exc)
         return None
-    return {"name": "llm_coherence_review", "passed": review.coherent, "details": review.notes}
 
 
 def build(deps: PipelineDeps):
@@ -56,13 +82,20 @@ def build(deps: PipelineDeps):
         )
 
         checks_json = report.to_json()
-        llm_check = await _optional_llm_review(deps, article)
-        if llm_check is not None:
-            checks_json = [*checks_json, llm_check]
+        editorial_review = await _editorial_review(deps, article)
+        if editorial_review is not None:
+            checks_json = [
+                *checks_json,
+                {
+                    "name": "article_editorial_review",
+                    "passed": editorial_review.coherent,
+                    "details": editorial_review.notes,
+                },
+            ]
 
         deps.validation_results.create(article_id=article.id, passed=report.passed, checks=checks_json)
         await deps.session.commit()
 
-        return {"validation_report": report}
+        return {"validation_report": report, "editorial_review": editorial_review}
 
     return validation_node

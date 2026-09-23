@@ -408,11 +408,78 @@ def section_generation_prompt(
     return system, user
 
 
-def llm_coherence_review_prompt(article_text: str) -> tuple[str, str]:
+def article_editorial_review_prompt(
+    *,
+    article_title: str,
+    sections: list[dict],
+    article_word_count: int,
+    target_word_count_min: int,
+    target_word_count_max: int,
+) -> tuple[str, str]:
+    """Returns (system, user) for the whole-article editorial review
+    (Batch 5) -- the ONE call in this pipeline that reads the fully
+    ASSEMBLED article (never the raw transcript, never per-chunk retrieval)
+    to catch problems that only exist at the article level: repetition
+    across non-adjacent sections, weak transitions, disproportionate
+    length, an introduction/conclusion not doing its job. Never a fidelity
+    re-check (app/services/article_validation.py and FIDELITY_CONSTRAINTS
+    already own that) -- this reviews organization, repetition,
+    proportion, and flow only, and never itself rewrites anything; its
+    findings are handed to the existing per-section revision mechanism
+    (app/ai/nodes/revision.py), the same one a failed deterministic check
+    already targets.
+
+    `sections` is `[{"sequence_number", "heading", "content"}, ...]` in
+    order -- the assembled article, nothing more.
+    """
     system = (
-        "You are reviewing a generated knowledge article for basic coherence and obvious problems -- "
-        "not a fidelity re-check (that's already done deterministically), just whether the writing "
-        "reads as a coherent, well-organized standalone article."
+        "You are the editorial reviewer for a knowledge article assembled from several independently "
+        "generated sections of a podcast-derived article. Section-by-section generation cannot "
+        "reliably catch problems that only become visible once the WHOLE article is read straight "
+        "through -- that is your job: read it as a single reader would and identify genuine "
+        "article-level problems, not section-level nitpicks (wording, style, and fidelity are already "
+        "handled elsewhere).\n\n"
+        "Look specifically for:\n"
+        "- Repetition: the same idea, mechanism, or explanation appearing in more than one section -- "
+        "especially non-adjacent sections, which section-by-section generation cannot see. Flag the "
+        "LATER section; a later section may legitimately revisit an idea only if it adds a genuinely "
+        "different layer (a new implication, a complication, a different angle) -- if it doesn't, "
+        "flag it.\n"
+        "- Weak or missing connection between consecutive sections -- a section that reads like an "
+        "unrelated topic dropped in rather than following from what came before.\n"
+        "- An introduction that doesn't establish the article's central question/tension, or reads "
+        "like a generic podcast intro, a biography, or a list of topics.\n"
+        "- A conclusion that merely repeats earlier sections instead of synthesizing, or that "
+        "introduces an unrelated major topic.\n"
+        "- Sections that are disproportionately long or short relative to their actual role in the "
+        "article.\n"
+        "- Tangents that don't serve the article's central question.\n"
+        "- An important idea that gets too little explanation, or a minor one that gets too much.\n\n"
+        f"The article's length target is a SOFT editorial guide of roughly {target_word_count_min}-"
+        f"{target_word_count_max} words; it is currently {article_word_count} words. If it is within "
+        "or close to that range and reads well, do not flag length as a problem at all. If it runs "
+        "substantially over, identify WHICH specific sections should be tightened and why -- "
+        "prioritize cutting duplicated ideas, repeated explanations, unnecessary framing, redundant "
+        "examples, and verbose transitions, in that order, never by suggesting every section be "
+        "uniformly shortened. Never suggest cutting a qualification, a disagreement, a source of "
+        "uncertainty, attribution, a key example that materially helps understanding, or an idea the "
+        "narrative arc actually needs.\n\n"
+        "For each section you flag in sections_needing_revision, give specific, actionable feedback a "
+        "writer could act on without re-reading the whole article -- name what it repeats or where the "
+        "actual problem is, never a vague \"improve flow\". Only flag a section for a genuine problem, "
+        "not because it could theoretically be tighter. If the article has no real article-level "
+        "problems, say so and leave sections_needing_revision empty -- do not invent issues to justify "
+        "a review. Use overall_feedback only for a genuine whole-article concern that isn't really any "
+        "one section's fault.\n\n"
+        "You are reviewing only for these article-level issues -- never suggest adding, removing, or "
+        "changing a fact, an attribution, or a source claim; that is out of scope here."
     )
-    user = f"Article:\n\n{article_text}\n\nIs this coherent and well-organized? Note any obvious issues."
+    section_blocks = "\n\n".join(
+        f"## Section {s['sequence_number']}: {s['heading']}\n\n{s['content']}" for s in sections
+    )
+    user = (
+        f"ARTICLE TITLE: {article_title}\n\n{section_blocks}\n\n---\n"
+        f"Total length: {article_word_count} words (soft target: {target_word_count_min}-"
+        f"{target_word_count_max})."
+    )
     return system, user

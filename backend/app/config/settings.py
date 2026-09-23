@@ -57,10 +57,15 @@ class Settings(BaseSettings):
     # app/providers/llm/factory.py.
     openai_fallback_enabled: bool = True
     openai_fallback_model: str = "gpt-5.4"
-    # Off by default: an LLM-based validation check is a supplementary
-    # signal, never a replacement for the deterministic checks in
-    # app/services/article_validation.py, and shouldn't add a paid call to
-    # every run until explicitly opted into.
+    # Off by default: the whole-article editorial review
+    # (app/ai/nodes/validation.py, app/ai/schemas.py::ArticleEditorialReview)
+    # is a supplementary signal, never a replacement for the deterministic
+    # checks in app/services/article_validation.py, and shouldn't add a
+    # paid call to every run until explicitly opted into. Its coherence
+    # judgment stays advisory-only (never affects ValidationReport.passed),
+    # but its flagged sections CAN independently trigger the existing
+    # per-section revision step (app/ai/graph.py::_should_revise) --
+    # enabling this is a real behavior/cost change, not just diagnostics.
     enable_llm_validation: bool = False
 
     embedding_model: str = ""

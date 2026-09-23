@@ -6,9 +6,20 @@ the regeneration prompt. A check that isn't tied to any specific section
 regenerated section. If no section can be identified at all, every
 section is regenerated -- simpler and safer than guessing.
 
+Batch 5: a second, independent source of targeted sections/feedback is
+merged in alongside the deterministic one -- the optional whole-article
+editorial review's own `sections_needing_revision`/`overall_feedback`
+(app/ai/nodes/validation.py, gated by Settings.enable_llm_validation).
+Both sources feed the SAME targeting/regenerate_all decision below; this
+node has no separate "editorial revision" code path, by design -- the
+review only ever decides WHICH sections need another look and why, this
+node still does the only rewriting, exactly as it already did for a
+deterministic failure.
+
 This is deliberately NOT a redesign of section_generation -- it reuses
-generate_section() so both the first pass and every revision share the
-same prompt/fidelity constraints.
+generate_section() so the first pass, a deterministic-triggered revision,
+and an editorial-review-triggered revision all share the same
+prompt/fidelity constraints.
 """
 
 import re
@@ -56,6 +67,23 @@ def build(deps: PipelineDeps):
         checks = report.to_json()
         targeted, shared_feedback = _sections_needing_revision(checks)
 
+        # Merge in the editorial review's own targeting (Batch 5), BEFORE
+        # regenerate_all is computed below -- a review that names specific
+        # sections (e.g. "section 4 repeats section 1's explanation") must
+        # result in targeted revision of exactly those, never a blind
+        # regenerate-everything pass, which is exactly the "don't solve
+        # length by uniformly shortening every section" failure mode this
+        # exists to avoid. None when the feature is off or the call failed
+        # (see app/ai/nodes/validation.py) -- identical to today.
+        editorial_review = state.get("editorial_review")
+        editorial_feedback_by_section: dict[int, str] = {}
+        if editorial_review is not None:
+            for item in editorial_review.sections_needing_revision:
+                targeted.add(item.sequence_number)
+                editorial_feedback_by_section[item.sequence_number] = item.feedback
+            if editorial_review.overall_feedback:
+                shared_feedback.append(f"editorial_review: {editorial_review.overall_feedback}")
+
         plan = state["plan"]
         chunk_by_id = {c.id: c for c in state["chunks"]}
         topic_by_id = {t.id: t for t in state["topics"]}
@@ -86,6 +114,8 @@ def build(deps: PipelineDeps):
                 if seq in targeted:
                     section_specific = [c.get("details", "") for c in checks if not c.get("passed") and f"section {seq}" in c.get("details", "")]
                     feedback_parts.extend(section_specific)
+                    if seq in editorial_feedback_by_section:
+                        feedback_parts.append(editorial_feedback_by_section[seq])
                 candidates.append(
                     await generate_section(
                         deps,
