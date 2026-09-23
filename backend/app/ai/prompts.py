@@ -97,30 +97,61 @@ def planning_prompt(
         "You are planning a knowledge article that turns a long-form podcast conversation into a "
         "substantially shorter, coherent, standalone EDITORIAL article -- not a transcript summary, and "
         "not a sequence of disconnected mini-summaries. The article must be grounded in the topics "
-        "below; do not invent a section about something not covered in them.\n\n"
+        "below; do not invent a section about something not covered in them, and do not invent a "
+        "relationship between two topics that they don't actually support -- every transition or "
+        "purpose you write must describe a real connection, never one invented to make the narrative "
+        "read more smoothly.\n\n"
+        "Before deciding on sections, identify the single central question, tension, argument, or idea "
+        "that gives the whole conversation its coherence -- the thing the article is really about. "
+        "State it explicitly as the core of introduction_summary; every section's purpose and every "
+        "transition should ultimately trace back to it.\n\n"
         "As a loose orientation -- never a template to fill in mechanically, the transcript's own "
         "content decides the real structure -- a well-built long-form article often moves from: the "
         "central idea or question, to the important mechanisms/ideas behind it, to practical "
         "implications, to complications or tensions, to personal stories or concrete examples, to "
         "broader meaning. Use only as much of this arc as the conversation actually supports.\n\n"
         "For EACH section, in addition to its heading and content, decide:\n"
-        "- narrative_purpose: one sentence, in your own words, explaining this section's editorial role "
-        '(e.g. "Establish the central principle that anchors the rest of the article.") -- an actual '
-        "explanation of what the section is for, not a category label.\n"
-        "- transition_from_previous: one sentence on why this section is the natural next step after "
-        "the previous one, not just the next topic on a list (leave blank for the first section).\n\n"
+        "- narrative_purpose: one sentence explaining what the reader understands or gains after this "
+        'section that they didn\'t before -- e.g. "Establish the central principle that anchors the '
+        'rest of the article." Never a generic label such as "introduction", "body", "conclusion", '
+        '"mechanism", or "summary".\n'
+        "- transition_from_previous: one sentence describing the actual logical relationship to the "
+        "previous section -- a consequence, a complication, a contrast, a deeper layer of the same "
+        'idea, and so on. Never filler such as "this continues the discussion", "this builds on the '
+        'previous section", "next, we discuss...", or "another important aspect..."; leave it blank '
+        "for the first section rather than write a filler sentence.\n\n"
+        "Treat repetition deliberately: assign each distinct idea to the ONE section that explains it "
+        "most fully. A later section may revisit that idea only if it adds a clearly different layer "
+        "(a complication, a concrete example, a consequence) -- say what that new layer is in its "
+        "narrative_purpose. If two moments in the conversation cover essentially the same ground, keep "
+        "the stronger one and leave the other out rather than give it a thin section of its own.\n\n"
+        "Prefer fewer, substantial sections over many small ones -- a section earns its place by doing "
+        "real work in the article's progression, not by improving topic coverage; never add a section "
+        "just because a topic exists. Personal stories, concrete examples, and moments of disagreement "
+        "or tension are often the most engaging material -- place them where they actually help the "
+        "reader understand or stay engaged (illustrating a point just made, grounding an abstract idea, "
+        "marking a genuine complication), not as a separate section for every anecdote in the "
+        "conversation.\n\n"
         "Preserve important disagreements/contrasting viewpoints as their own planning notes so the "
         "writer doesn't flatten them later. Decide a sensible title, introduction, section ordering, and "
         "conclusion. The introduction should establish the central question or tension the conversation "
         "explores and give the reader a genuine reason to keep reading -- not a biography of the "
         "speakers unless the biography itself is directly relevant. The conclusion should return to that "
-        "central question and offer a synthesis, not a restatement of every section in order.\n\n"
+        "same central question and offer a synthesis, not a restatement of every section in order, and "
+        "should not introduce a new major topic just because the conversation happened to cover it "
+        "late.\n\n"
+        "For every section you should be able to answer: what does the reader know after it that they "
+        "didn't before, why does it come at this point rather than earlier or later, and what makes "
+        "them want to keep reading into the next one -- narrative_purpose and transition_from_previous "
+        "are where those answers belong.\n\n"
         f"Aim for approximately {target_section_count_min}-{target_section_count_max} sections for a "
         "conversation of this length -- fewer is fine if the conversation genuinely covers less ground, "
         "and more is fine if it genuinely needs it, but never split or merge sections merely to hit a "
-        f"number. The finished article should read at roughly {target_word_count_min}-{target_word_count_max} "
-        "words in total -- size and scope sections with that in mind, favoring one well-developed "
-        "treatment of each idea over spreading it across multiple sections that each re-explain it."
+        "number, and never add one just to raise topic coverage. The finished article should read at "
+        f"roughly {target_word_count_min}-{target_word_count_max} words in total -- reach that mainly "
+        "through tighter scope and less repetition, favoring one well-developed treatment of each idea "
+        "over spreading it across multiple sections that each re-explain it, not by cutting genuinely "
+        "important ideas, stories, or qualifications."
     )
     topic_lines = "\n\n".join(
         f"[topic {t.sequence_number}] {t.title}\n{t.summary}\n"
@@ -271,11 +302,22 @@ def section_generation_prompt(
             f"{introduction_summary}"
         )
     if is_last_section and conclusion_summary:
+        # Includes introduction_summary (not just conclusion_summary) --
+        # "return to the central question the introduction raised" is an
+        # empty instruction without the actual text of what that was.
+        # introduction_summary already reaches this function for every
+        # section (see generate_section), this block just hadn't been
+        # rendering it.
+        central_question_line = (
+            f" The article's central question, as established in the introduction: {introduction_summary}"
+            if introduction_summary
+            else ""
+        )
         parts.append(
             "\nThis is the ARTICLE'S CLOSING SECTION. Beyond the key ideas above, use it to return to "
             "the central question or idea the introduction raised and offer a synthesis -- do not "
             "mechanically restate each earlier section, and do not introduce a completely new major "
-            f"topic here.\nPlanned conclusion intent: {conclusion_summary}"
+            f"topic here.{central_question_line}\nPlanned conclusion intent: {conclusion_summary}"
         )
 
     if preceding_sections_key_ideas or preceding_section_excerpt:

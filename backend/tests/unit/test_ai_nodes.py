@@ -831,6 +831,30 @@ def test_section_generation_prompt_adds_closing_block_only_for_last_section_with
     assert "ARTICLE'S CLOSING SECTION" not in middle
 
 
+def test_section_generation_prompt_closing_block_includes_the_actual_introduction_text() -> None:
+    """Regression test: "return to the central question the introduction
+    raised" is an empty instruction without the actual introduction text --
+    the closing section must be shown introduction_summary, not just
+    conclusion_summary (introduction_summary already reaches this function
+    for every section via generate_section; this only checks the closing
+    block actually renders it)."""
+    _, last = section_generation_prompt(
+        heading="Conclusion",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro", "Middle", "Conclusion"],
+        current_section_number=2,
+        introduction_summary="the central tension is whether X or Y",
+        conclusion_summary="return to the central question",
+    )
+
+    assert "the central tension is whether X or Y" in last
+
+
 def test_section_generation_prompt_includes_already_covered_block_from_both_layers() -> None:
     _, user = section_generation_prompt(
         heading="Conclusion",

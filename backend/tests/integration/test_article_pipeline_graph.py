@@ -302,6 +302,11 @@ async def test_pipeline_passes_narrative_context_and_already_covered_material_to
     assert "idea B" in conclusion_prompt
     assert "Closing thought TAIL1" in conclusion_prompt
     assert "Closing thought TAIL0" not in conclusion_prompt
+    # Regression: "return to the central question the introduction raised"
+    # is an empty instruction without the actual text of what that was --
+    # the closing section must also see introduction_summary, not just
+    # conclusion_summary.
+    assert "central question X" in conclusion_prompt
 
     # Soft per-section word-count guidance derived from
     # Settings.article_target_word_count_min/max (defaults 5500/6500) split
