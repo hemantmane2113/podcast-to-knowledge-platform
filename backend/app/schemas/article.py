@@ -32,7 +32,13 @@ class ArticleSectionResponse(BaseModel):
 class ValidationCheckResponse(BaseModel):
     name: str
     passed: bool
+    # "pass" | "warning" | "failure" (app/services/article_validation.py) --
+    # defaults keep this compatible with any older persisted checks JSON
+    # that predates severity/sections/metrics.
+    severity: str = "pass"
     details: str
+    sections: list[int] = []
+    metrics: dict = {}
 
 
 class ValidationResultResponse(BaseModel):

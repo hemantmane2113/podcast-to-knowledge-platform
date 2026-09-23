@@ -1129,11 +1129,11 @@ async def test_generate_section_omits_narrative_fields_absent_from_planned_secti
 
 
 def _passed_report() -> ValidationReport:
-    return ValidationReport(checks=[CheckResult(name="x", passed=True, details="ok")])
+    return ValidationReport(checks=[CheckResult(name="x", severity="pass", details="ok")])
 
 
 def _failed_report() -> ValidationReport:
-    return ValidationReport(checks=[CheckResult(name="x", passed=False, details="bad")])
+    return ValidationReport(checks=[CheckResult(name="x", severity="failure", details="bad")])
 
 
 def test_should_revise_ends_when_deterministic_passes_and_no_editorial_review_ran() -> None:

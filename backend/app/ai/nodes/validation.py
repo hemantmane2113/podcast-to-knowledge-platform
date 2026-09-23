@@ -79,6 +79,8 @@ def build(deps: PipelineDeps):
             max_length_ratio=deps.settings.article_max_length_ratio,
             min_sections=deps.settings.section_count_min,
             max_sections=deps.settings.section_count_max,
+            target_word_count_min=deps.settings.article_target_word_count_min,
+            target_word_count_max=deps.settings.article_target_word_count_max,
         )
 
         checks_json = report.to_json()
