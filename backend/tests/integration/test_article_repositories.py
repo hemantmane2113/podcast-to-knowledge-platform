@@ -7,8 +7,10 @@ from app.models.episode import Episode, ProcessingStatus
 from app.models.transcript import Transcript
 from app.repositories.article_plan_repository import ArticlePlanRepository, PlannedSectionData
 from app.repositories.article_repository import ArticleRepository, ArticleSectionCandidate
+from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.topic_repository import TopicCandidate, TopicRepository
 from app.repositories.validation_result_repository import ValidationResultRepository
+from app.services.chunking_service import ChunkCandidate
 
 
 async def _seed_episode_and_transcript(session: AsyncSession) -> tuple[Episode, Transcript]:
@@ -157,6 +159,55 @@ async def test_article_plan_replace_cascades_to_existing_article(db_session: Asy
     await db_session.commit()
 
     assert await article_repo.get_by_episode_id(episode.id) is None
+
+
+async def test_article_plan_delete_by_episode_id_cascades_but_leaves_topics_and_chunks(
+    db_session: AsyncSession,
+) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    plan_repo = ArticlePlanRepository(db_session)
+    article_repo = ArticleRepository(db_session)
+    validation_repo = ValidationResultRepository(db_session)
+
+    chunks = await ChunkRepository(db_session).replace_all(
+        transcript_id=transcript.id,
+        episode_id=episode.id,
+        candidates=[
+            ChunkCandidate(
+                sequence_number=0, text="text", start_ms=0, end_ms=1000, source_segment_ids=[], token_count=5
+            )
+        ],
+    )
+    await db_session.commit()
+    topics = await TopicRepository(db_session).replace_all(
+        transcript_id=transcript.id,
+        episode_id=episode.id,
+        candidates=[
+            TopicCandidate(sequence_number=0, title="t", summary="s", chunk_ids=[chunks[0].id]),
+        ],
+    )
+    await db_session.commit()
+
+    plan = await plan_repo.replace(
+        episode_id=episode.id, title="p", introduction_summary="i", conclusion_summary="c", sections=[]
+    )
+    await db_session.commit()
+    article = await article_repo.replace(
+        episode_id=episode.id, article_plan_id=plan.id, title="t", revision_count=0, sections=[]
+    )
+    await db_session.commit()
+    validation_repo.create(article_id=article.id, passed=True, checks=[])
+    await db_session.commit()
+
+    await plan_repo.delete_by_episode_id(episode.id)
+    await db_session.commit()
+
+    assert await plan_repo.get_by_episode_id(episode.id) is None
+    assert await article_repo.get_by_episode_id(episode.id) is None
+    assert await validation_repo.get_latest_by_article_id(article.id) is None
+    # Topics and Chunks are untouched -- neither has a FK to ArticlePlan.
+    assert len(await TopicRepository(db_session).get_by_transcript_id(transcript.id)) == 1
+    assert len(await ChunkRepository(db_session).get_by_transcript_id(transcript.id)) == 1
 
 
 # --- ArticleRepository -----------------------------------------------------------------

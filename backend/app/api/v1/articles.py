@@ -24,6 +24,24 @@ async def generate_article(episode_id: uuid.UUID, service: ArticleServiceDep) ->
     return GenerateArticleResponse(episode_id=episode_id, job_id=job.id)
 
 
+@router.post(
+    "/{episode_id}/regenerate-article",
+    response_model=GenerateArticleResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def regenerate_article(episode_id: uuid.UUID, service: ArticleServiceDep) -> GenerateArticleResponse:
+    """Explicit regeneration -- unlike generate-article, an existing
+    completed article is never a reason to skip enqueueing a fresh run
+    (see ArticleService.request_regeneration for the exact lifecycle:
+    the episode's ArticlePlan/Article/ArticleSections/ValidationResults
+    are replaced by the new pipeline run; Topics and Chunks are kept).
+    An already-active job is still respected, exactly as generate-article
+    does. Same async-everything shape: enqueues and returns immediately.
+    """
+    job = await service.request_regeneration(episode_id)
+    return GenerateArticleResponse(episode_id=episode_id, job_id=job.id)
+
+
 @router.get("/{episode_id}/article", response_model=ArticleResponse)
 async def get_article(episode_id: uuid.UUID, service: ArticleServiceDep) -> ArticleResponse:
     episode, article, chunks = await service.get_article_with_chunks(episode_id)

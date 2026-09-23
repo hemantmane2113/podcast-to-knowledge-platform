@@ -35,6 +35,28 @@ class ArticlePlanRepository:
         )
         return result.scalar_one_or_none()
 
+    async def delete_by_episode_id(self, episode_id: uuid.UUID) -> None:
+        """A Core-level DELETE -- deliberately not `session.get()` +
+        `session.delete()`, so nothing needs to be loaded into the
+        identity map first (same idiom as the delete half of replace()
+        below, factored out so a caller that only wants to invalidate
+        an episode's plan -- without immediately replacing it, e.g.
+        ArticleService.request_regeneration -- doesn't have to duplicate
+        the statement). The DB's own ON DELETE CASCADE
+        (Article.article_plan_id, ArticleSection.article_id,
+        ValidationResult.article_id) removes the Article/ArticleSections/
+        ValidationResults generated from this plan in the same operation;
+        Topic and Chunk are untouched -- neither has a FK to ArticlePlan.
+
+        Because this bypasses the ORM's own cascade machinery, any
+        Article/ArticlePlan/ArticleSection/ValidationResult objects
+        already loaded into the CALLING session's identity map are not
+        automatically updated to reflect the delete -- the caller is
+        responsible for expiring the session afterward if that matters
+        (see ArticleService.request_regeneration).
+        """
+        await self._session.execute(delete(ArticlePlan).where(ArticlePlan.episode_id == episode_id))
+
     async def replace(
         self,
         *,
@@ -50,7 +72,7 @@ class ArticlePlanRepository:
         generated from the old plan, and the pipeline regenerates the
         article from the new plan right after this anyway.
         """
-        await self._session.execute(delete(ArticlePlan).where(ArticlePlan.episode_id == episode_id))
+        await self.delete_by_episode_id(episode_id)
 
         plan = ArticlePlan(
             id=uuid.uuid4(),
