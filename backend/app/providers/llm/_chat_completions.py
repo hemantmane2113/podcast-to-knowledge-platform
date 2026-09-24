@@ -126,6 +126,34 @@ _STRUCTURED_OUTPUT_INSTRUCTION = (
     "the JSON:\n\n{schema}"
 )
 
+
+def _strip_schema_descriptions(node: Any) -> Any:
+    """Recursively removes every `"description"` key from a JSON Schema
+    dict/list structure -- Pydantic's `model_json_schema()` auto-populates
+    `"description"` (at the top level and for any nested model under
+    `$defs`) from the response_model's own Python docstring, which is
+    internal engineering documentation never meant to be read by the
+    model. Sent unfiltered, it puts implementation details (module paths,
+    function names, other schemas' field names) directly into the model's
+    own formatting instructions -- a real, observed source of the model
+    echoing that vocabulary back into its own structured output (see
+    generate_structured below). Every other key -- `properties`, `type`,
+    `required`, `items`, `enum`, `$defs`, `$ref`, `title`, etc. -- is
+    preserved exactly as Pydantic produced it, so no structural
+    information the model actually needs for validation is lost."""
+    if isinstance(node, dict):
+        return {key: _strip_schema_descriptions(value) for key, value in node.items() if key != "description"}
+    if isinstance(node, list):
+        return [_strip_schema_descriptions(item) for item in node]
+    return node
+
+
+def _build_llm_schema(response_model: type[BaseModel]) -> dict[str, Any]:
+    """The JSON Schema actually sent to the model for `response_model` --
+    always this, never `response_model.model_json_schema()` directly (see
+    _strip_schema_descriptions)."""
+    return _strip_schema_descriptions(response_model.model_json_schema())
+
 # Groq's `response_format={"type": "json_object"}` performs its own
 # server-side check that the model's generation is syntactically valid
 # JSON, and rejects the request with HTTP 400 + `error.code ==
@@ -216,7 +244,7 @@ class ChatCompletionsProvider(LLMProvider):
         from app.core.exceptions import LLMStructuredOutputError
 
         schema_instruction = _STRUCTURED_OUTPUT_INSTRUCTION.format(
-            schema=json.dumps(response_model.model_json_schema())
+            schema=json.dumps(_build_llm_schema(response_model))
         )
         combined_system = f"{system}\n\n{schema_instruction}" if system else schema_instruction
         payload_messages = _build_messages(messages, combined_system)

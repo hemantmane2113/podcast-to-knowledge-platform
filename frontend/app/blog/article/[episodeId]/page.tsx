@@ -65,11 +65,12 @@ export default async function BlogArticlePage({
 
       {(article.episode_title || article.channel_name || article.youtube_url) && (
         <div className="mt-6 rounded-lg border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-600">
-          <p>
-            Based on the conversation
-            {article.episode_title ? <>: <span className="font-medium">{article.episode_title}</span></> : null}
-          </p>
-          {article.channel_name && <p className="mt-1">{article.channel_name}</p>}
+          {article.episode_title && (
+            <p>
+              Based on: <span className="font-medium">{article.episode_title}</span>
+            </p>
+          )}
+          {article.channel_name && <p className="mt-1">Channel: {article.channel_name}</p>}
           {article.youtube_url && (
             <p className="mt-1">
               <a
@@ -78,7 +79,7 @@ export default async function BlogArticlePage({
                 rel="noopener noreferrer"
                 className="text-neutral-700 underline hover:text-neutral-900"
               >
-                Watch the original conversation on YouTube
+                Watch on YouTube →
               </a>
             </p>
           )}

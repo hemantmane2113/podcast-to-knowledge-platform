@@ -32,6 +32,7 @@ from app.providers.llm._chat_completions import (
     DEFAULT_CLIENT_MAX_RETRIES,
     DEFAULT_CLIENT_TIMEOUT_SECONDS,
     ChatCompletionsProvider,
+    _build_llm_schema,
     _is_model_json_validation_failure,
 )
 from app.providers.llm.base import LLMMessage
@@ -45,6 +46,23 @@ from app.providers.llm.opensource_provider import OpenSourceProvider
 class _Example(BaseModel):
     title: str
     count: int
+
+
+class _NestedChild(BaseModel):
+    """NESTED_INTERNAL_DOCSTRING_MARKER: engineering notes about this nested
+    model that must never reach the model -- e.g. app/ai/nodes/child.py."""
+
+    value: str
+
+
+class _ExampleWithDocstring(BaseModel):
+    """TOP_LEVEL_INTERNAL_DOCSTRING_MARKER: engineering notes about this
+    schema -- module paths, other function names, implementation details --
+    that must never reach the model. See app/ai/nodes/section_generation.py."""
+
+    title: str
+    tags: list[str]
+    child: _NestedChild
 
 
 def _fake_completion(content: str) -> SimpleNamespace:
@@ -373,6 +391,86 @@ async def test_generate_structured_includes_json_schema_in_system_prompt() -> No
     assert "Be helpful." in sent_messages[0]["content"]
     assert "\"title\"" in sent_messages[0]["content"]  # schema property present
     assert create.call_args_list[0].kwargs["response_format"] == {"type": "json_object"}
+
+
+# --- _build_llm_schema(): internal docstrings must never reach the model -----------
+# (app/providers/llm/_chat_completions.py::_strip_schema_descriptions) --
+# Pydantic's model_json_schema() auto-populates "description" from a
+# model's own Python docstring; that's engineering documentation, not
+# something the model should ever see as part of its own formatting
+# instructions (a real, observed source of the model echoing that
+# vocabulary back into its own structured output).
+
+
+def test_build_llm_schema_strips_the_top_level_docstring() -> None:
+    schema = _build_llm_schema(_ExampleWithDocstring)
+
+    assert "description" not in schema
+    assert "TOP_LEVEL_INTERNAL_DOCSTRING_MARKER" not in json.dumps(schema)
+
+
+def test_build_llm_schema_strips_a_nested_models_docstring_under_defs() -> None:
+    schema = _build_llm_schema(_ExampleWithDocstring)
+
+    # $defs holds the nested _NestedChild model's own schema, which also
+    # got a "description" from ITS docstring -- must be stripped too, not
+    # just the top-level one.
+    assert "$defs" in schema
+    nested_schema = schema["$defs"]["_NestedChild"]
+    assert "description" not in nested_schema
+    assert "NESTED_INTERNAL_DOCSTRING_MARKER" not in json.dumps(schema)
+
+
+def test_build_llm_schema_preserves_all_structural_validation_information() -> None:
+    """Stripping descriptions must never touch anything the model actually
+    needs to produce a schema-valid response: properties, types, required
+    fields, array item types, and $defs/$ref for nested models all survive
+    unchanged."""
+    schema = _build_llm_schema(_ExampleWithDocstring)
+
+    assert schema["type"] == "object"
+    assert set(schema["required"]) == {"title", "tags", "child"}
+    assert schema["properties"]["title"]["type"] == "string"
+    assert schema["properties"]["tags"]["type"] == "array"
+    assert schema["properties"]["tags"]["items"]["type"] == "string"
+    assert schema["properties"]["child"]["$ref"] == "#/$defs/_NestedChild"
+    assert schema["$defs"]["_NestedChild"]["properties"]["value"]["type"] == "string"
+    assert schema["$defs"]["_NestedChild"]["required"] == ["value"]
+
+
+def test_build_llm_schema_is_a_noop_for_a_model_with_no_docstring() -> None:
+    """A model without a docstring never had a "description" key to begin
+    with -- confirms stripping doesn't depend on one being present, and
+    existing schemas without docstrings (e.g. _Example) are unaffected."""
+    schema = _build_llm_schema(_Example)
+    assert "description" not in schema
+    assert schema == _Example.model_json_schema()
+
+
+async def test_generate_structured_never_sends_a_response_models_docstring_to_the_llm() -> None:
+    """End-to-end through generate_structured (not just _build_llm_schema
+    in isolation): the actual prompt payload sent to the client must not
+    contain the response_model's docstring text, at any nesting level --
+    while the schema's actual structural information (property names) is
+    still present, and parsing a real response against the schema still
+    works."""
+    valid_json = json.dumps({"title": "hello", "tags": ["a", "b"], "child": {"value": "x"}})
+    create = AsyncMock(return_value=_fake_completion(valid_json))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="hi")],
+        response_model=_ExampleWithDocstring,
+        system="Be helpful.",
+    )
+
+    sent_content = create.call_args_list[0].kwargs["messages"][0]["content"]
+    assert "TOP_LEVEL_INTERNAL_DOCSTRING_MARKER" not in sent_content
+    assert "NESTED_INTERNAL_DOCSTRING_MARKER" not in sent_content
+    assert "\"title\"" in sent_content  # schema property still present
+    assert "\"tags\"" in sent_content
+    assert result == _ExampleWithDocstring(title="hello", tags=["a", "b"], child=_NestedChild(value="x"))
 
 
 # --- generate_structured(): Groq's own `json_validate_failed` structured------------
