@@ -1,12 +1,13 @@
 import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import delete, select
+from sqlalchemy import Row, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.article import Article
 from app.models.article_section import ArticleSection
+from app.models.episode import Episode, ProcessingStatus
 
 
 @dataclass
@@ -35,6 +36,23 @@ class ArticleRepository:
             .options(selectinload(Article.sections), selectinload(Article.validation_results))
         )
         return result.scalar_one_or_none()
+
+    async def list_published_summaries(self) -> list[Row]:
+        """The public blog listing's minimal projection (episode_id,
+        title, article_published_at) -- a bare column SELECT rather than
+        full Article ORM objects with eager-loaded sections, since a
+        listing never needs section content. Newest publish first."""
+        result = await self._session.execute(
+            select(
+                Article.episode_id.label("episode_id"),
+                Article.title.label("title"),
+                Episode.article_published_at.label("article_published_at"),
+            )
+            .join(Episode, Article.episode_id == Episode.id)
+            .where(Episode.status == ProcessingStatus.PUBLISHED)
+            .order_by(Episode.article_published_at.desc())
+        )
+        return list(result.all())
 
     async def replace(
         self,

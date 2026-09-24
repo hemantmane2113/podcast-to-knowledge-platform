@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import inspect
@@ -437,6 +438,181 @@ async def test_request_regeneration_expires_stale_already_loaded_article_objects
     # And the row is genuinely gone, not just marked expired: a fresh
     # query (not a reload of this specific stale instance) confirms it.
     assert await article_repo.get_by_episode_id(episode.id) is None
+
+
+# --- publish_article / POST publish ----------------------------------------------------
+
+
+async def test_publish_unknown_episode_returns_404(db_session: AsyncSession) -> None:
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{uuid.uuid4()}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "EPISODE_NOT_FOUND"
+
+
+async def test_publish_episode_without_article_returns_article_not_found(db_session: AsyncSession) -> None:
+    episode, _ = await _seed_episode_and_transcript(db_session)
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "ARTICLE_NOT_FOUND"
+
+
+async def test_publish_fails_when_latest_validation_has_not_passed(db_session: AsyncSession) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_completed_article(db_session, episode, transcript)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    ValidationResultRepository(db_session).create(
+        article_id=article.id, passed=False, checks=[{"name": "x", "passed": False, "details": "bad"}]
+    )
+    await db_session.commit()
+
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_VALIDATION_NOT_PASSED"
+
+    fresh = await db_session.get(Episode, episode.id)
+    assert fresh.status != ProcessingStatus.PUBLISHED
+    assert fresh.article_published_at is None
+
+
+async def test_publish_fails_when_no_validation_result_exists_yet(db_session: AsyncSession) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_completed_article(db_session, episode, transcript)
+    # No ValidationResult row created at all.
+
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "ARTICLE_VALIDATION_NOT_PASSED"
+
+
+async def test_publish_succeeds_and_sets_status_and_published_at(db_session: AsyncSession) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_completed_article(db_session, episode, transcript)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    ValidationResultRepository(db_session).create(
+        article_id=article.id, passed=True, checks=[{"name": "x", "passed": True, "details": "ok"}]
+    )
+    await db_session.commit()
+
+    before = datetime.now(UTC)
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "PUBLISHED"
+    assert body["article_published_at"] is not None
+    published_at = datetime.fromisoformat(body["article_published_at"])
+    assert published_at >= before
+
+    fresh = await db_session.get(Episode, episode.id)
+    assert fresh.status == ProcessingStatus.PUBLISHED
+    assert fresh.article_published_at is not None
+
+
+async def test_publish_does_not_modify_article_plan_or_sections(db_session: AsyncSession) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    chunk = (
+        await ChunkRepository(db_session).replace_all(
+            transcript_id=transcript.id,
+            episode_id=episode.id,
+            candidates=[
+                ChunkCandidate(
+                    sequence_number=0, text="t", start_ms=0, end_ms=1_000, source_segment_ids=[], token_count=5
+                )
+            ],
+        )
+    )[0]
+    await db_session.commit()
+    plan = await ArticlePlanRepository(db_session).replace(
+        episode_id=episode.id, title="p", introduction_summary="i", conclusion_summary="c", sections=[]
+    )
+    await db_session.commit()
+    article = await ArticleRepository(db_session).replace(
+        episode_id=episode.id,
+        article_plan_id=plan.id,
+        title="The Article",
+        revision_count=0,
+        sections=[
+            ArticleSectionCandidate(
+                sequence_number=0, heading="Intro", content="Original prose.", supporting_chunk_ids=[chunk.id]
+            )
+        ],
+    )
+    await db_session.commit()
+    ValidationResultRepository(db_session).create(article_id=article.id, passed=True, checks=[])
+    await db_session.commit()
+    original_article_id = article.id
+    original_plan_id = plan.id
+
+    client = await _client(db_session)
+    try:
+        response = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 200
+
+    refreshed_plan = await ArticlePlanRepository(db_session).get_by_episode_id(episode.id)
+    assert refreshed_plan.id == original_plan_id  # never replaced
+
+    refreshed_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    assert refreshed_article.id == original_article_id  # never replaced
+    assert refreshed_article.revision_count == 0
+    assert len(refreshed_article.sections) == 1
+    assert refreshed_article.sections[0].content == "Original prose."
+    assert refreshed_article.sections[0].heading == "Intro"
+
+
+async def test_publish_is_idempotent_when_already_published(db_session: AsyncSession) -> None:
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_completed_article(db_session, episode, transcript)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    ValidationResultRepository(db_session).create(article_id=article.id, passed=True, checks=[])
+    await db_session.commit()
+
+    client = await _client(db_session)
+    try:
+        first = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+        second = await client.post(f"/api/v1/episodes/{episode.id}/publish")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["status"] == "PUBLISHED"
+    # Republishing must not move the timestamp forward (no second
+    # "publication record" -- there is only Episode.status/article_published_at).
+    assert second.json()["article_published_at"] == first.json()["article_published_at"]
 
 
 async def test_get_article_unknown_episode_returns_404(db_session: AsyncSession) -> None:

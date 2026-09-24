@@ -2,12 +2,14 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ArticleNotFoundError, EpisodeNotFoundError
+from sqlalchemy import Row
+
+from app.core.exceptions import ArticleNotFoundError, ArticleValidationNotPassedError, EpisodeNotFoundError
 from app.models.article import Article
 from app.models.article_plan import ArticlePlan
 from app.models.article_section import ArticleSection
 from app.models.chunk import Chunk
-from app.models.episode import Episode
+from app.models.episode import Episode, ProcessingStatus
 from app.models.processing_job import JobType, ProcessingJob
 from app.models.validation_result import ValidationResult
 from app.repositories.article_plan_repository import ArticlePlanRepository
@@ -16,6 +18,7 @@ from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.episode_repository import EpisodeRepository
 from app.repositories.processing_job_repository import ProcessingJobRepository
 from app.repositories.transcript_repository import TranscriptRepository
+from app.repositories.validation_result_repository import ValidationResultRepository
 from app.services.job_queue import JobQueue
 
 # The model classes ArticlePlanRepository.delete_by_episode_id's cascade
@@ -41,6 +44,7 @@ class ArticleService:
         self._transcripts = TranscriptRepository(session)
         self._chunks = ChunkRepository(session)
         self._jobs = ProcessingJobRepository(session)
+        self._validation_results = ValidationResultRepository(session)
 
     async def get_article_with_chunks(self, episode_id: uuid.UUID) -> tuple[Episode, Article, list[Chunk]]:
         episode = await self._episodes.get_by_id(episode_id)
@@ -88,6 +92,76 @@ class ArticleService:
         await self._session.commit()
         await self._job_queue.enqueue_article_generation(episode_id=episode_id, job_id=job.id)
         return job
+
+    async def publish_article(self, episode_id: uuid.UUID) -> Episode:
+        """The explicit, deliberate last step of generate -> validate ->
+        human review -> explicit publish -- never automatic after
+        generation (nothing else in this codebase calls this). Reuses
+        the existing validation model as the sole source of truth for
+        "has this article passed validation": ValidationResultRepository
+        .get_latest_by_article_id's `passed` column (already deterministic
+        -- see app/services/article_validation.py -- and already
+        WARNING-tolerant, since a WARNING-severity check still counts as
+        passed there). No new validation mechanism.
+
+        Idempotent: an already-PUBLISHED episode is returned unchanged --
+        article_published_at is stamped once, on the transition into
+        PUBLISHED, and never bumped forward by a repeat call, since
+        there's no separate "publication record" to create here
+        (Episode.status/article_published_at ARE the record).
+
+        Touches only the Episode row -- ArticlePlan, Article,
+        ArticleSections, Topics, and Chunks are never modified.
+        """
+        episode = await self._episodes.get_by_id(episode_id)
+        if episode is None:
+            raise EpisodeNotFoundError(f"Episode {episode_id} not found")
+
+        if episode.status == ProcessingStatus.PUBLISHED:
+            return episode
+
+        article = await self._articles.get_by_episode_id(episode_id)
+        if article is None:
+            raise ArticleNotFoundError(f"Episode {episode_id} has no generated article yet")
+
+        latest_validation = await self._validation_results.get_latest_by_article_id(article.id)
+        if latest_validation is None or not latest_validation.passed:
+            raise ArticleValidationNotPassedError(
+                f"Episode {episode_id}'s article has not passed validation yet"
+            )
+
+        self._episodes.mark_published(episode)
+        await self._session.commit()
+        # updated_at (app/models/base.py::TimestampMixin) has a
+        # server-side onupdate=func.now() -- after an UPDATE, SQLAlchemy
+        # marks it as needing a fresh read regardless of session-wide
+        # expire_on_commit settings, since the actual computed value isn't
+        # known until fetched. EpisodeResponse.model_validate() is a
+        # synchronous Pydantic call, so a lazy-load triggered from inside
+        # it can't run (MissingGreenlet) -- refresh explicitly first, the
+        # same async-safe pattern used elsewhere in this service for the
+        # analogous stale/expired-attribute risk.
+        await self._session.refresh(episode)
+        return episode
+
+    async def get_published_article(self, episode_id: uuid.UUID) -> tuple[Episode, Article, list[Chunk]]:
+        """The public counterpart to get_article_with_chunks: an
+        identical lookup, but only ever returns an article whose episode
+        is actually PUBLISHED. An article that exists but isn't
+        published yet raises the SAME ArticleNotFoundError "doesn't
+        exist" already uses -- a public caller must never be able to
+        distinguish "no article" from "not published yet" (see
+        ArticleNotFoundError's docstring)."""
+        episode, article, chunks = await self.get_article_with_chunks(episode_id)
+        if episode.status != ProcessingStatus.PUBLISHED:
+            raise ArticleNotFoundError(f"Episode {episode_id} has no published article")
+        return episode, article, chunks
+
+    async def list_published_articles(self) -> list[Row]:
+        """PUBLISHED-only blog listing (episode_id, title,
+        article_published_at), newest first -- see
+        ArticleRepository.list_published_summaries."""
+        return await self._articles.list_published_summaries()
 
     async def request_regeneration(self, episode_id: uuid.UUID) -> ProcessingJob:
         """The explicit "regenerate" entry point request_generation's own

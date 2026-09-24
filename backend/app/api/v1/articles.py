@@ -4,6 +4,7 @@ from fastapi import APIRouter, status
 
 from app.api.deps import ArticleServiceDep
 from app.schemas.article import ArticleResponse, GenerateArticleResponse
+from app.schemas.episode import EpisodeResponse
 
 router = APIRouter(prefix="/episodes", tags=["articles"])
 
@@ -47,3 +48,17 @@ async def get_article(episode_id: uuid.UUID, service: ArticleServiceDep) -> Arti
     episode, article, chunks = await service.get_article_with_chunks(episode_id)
     chunks_by_id = {c.id: c for c in chunks}
     return ArticleResponse.from_models(article, episode.status, chunks_by_id)
+
+
+@router.post("/{episode_id}/publish", response_model=EpisodeResponse)
+async def publish_article(episode_id: uuid.UUID, service: ArticleServiceDep) -> EpisodeResponse:
+    """Explicit publish -- the deliberate final step of generate ->
+    validate -> human review -> explicit publish (see
+    ArticleService.publish_article for the exact lifecycle: requires an
+    existing article with a passing latest validation result, and never
+    modifies ArticlePlan/Article/ArticleSections/Topics/Chunks). Never
+    triggered automatically after generation. Idempotent: publishing an
+    already-published episode returns its current state unchanged.
+    """
+    episode = await service.publish_article(episode_id)
+    return EpisodeResponse.model_validate(episode)

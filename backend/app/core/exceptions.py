@@ -62,10 +62,23 @@ class ChunksNotFoundError(AppError):
 
 
 class ArticleNotFoundError(AppError):
-    """No article has been generated for this episode yet."""
+    """No article has been generated for this episode yet -- also raised
+    (deliberately) by the public read path for an article that exists
+    but isn't PUBLISHED, so an unpublished article's existence is never
+    distinguishable from "no article at all" to a public caller."""
 
     code = "ARTICLE_NOT_FOUND"
     status_code = 404
+
+
+class ArticleValidationNotPassedError(AppError):
+    """The article's latest ValidationResult doesn't exist or didn't
+    pass (app/services/article_validation.py) -- publishing requires a
+    validated article (generate -> validate -> human review -> explicit
+    publish); this is never bypassed."""
+
+    code = "ARTICLE_VALIDATION_NOT_PASSED"
+    status_code = 409
 
 
 class TranscriptProviderError(AppError):

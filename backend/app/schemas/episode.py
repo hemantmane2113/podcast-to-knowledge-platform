@@ -28,6 +28,7 @@ class EpisodeResponse(BaseModel):
 
     status: ProcessingStatus
     last_error: str | None
+    article_published_at: datetime | None
 
     created_at: datetime
     updated_at: datetime

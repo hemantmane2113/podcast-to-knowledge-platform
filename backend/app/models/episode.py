@@ -66,6 +66,15 @@ class Episode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     last_error: Mapped[str | None] = mapped_column(Text)
 
+    # When OUR generated article was explicitly published (status ->
+    # PUBLISHED) -- deliberately a separate column from `published_at`
+    # above, which is the source YouTube video's own publish date
+    # (populated by ingestion from Supadata metadata, often long before
+    # any article exists). Null until publish_article actually runs; set
+    # exactly once (see EpisodeRepository.mark_published) -- republishing
+    # an already-PUBLISHED episode never bumps it forward.
+    article_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     transcript: Mapped["Transcript | None"] = relationship(
         back_populates="episode", uselist=False, cascade="all, delete-orphan"
     )

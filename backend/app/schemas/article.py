@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from app.models.article import Article
 from app.models.chunk import Chunk
-from app.models.episode import ProcessingStatus
+from app.models.episode import Episode, ProcessingStatus
 from app.models.validation_result import ValidationResult
 
 _SOURCE_PREVIEW_CHARS = 240
@@ -112,3 +112,83 @@ class ArticleResponse(BaseModel):
 class GenerateArticleResponse(BaseModel):
     episode_id: uuid.UUID
     job_id: uuid.UUID
+
+
+# --- Public (published-articles-only) responses ------------------------------------------
+#
+# Deliberately separate from ArticleResponse above, which is the Phase I
+# reviewer-facing shape -- it exposes validation internals (checks,
+# severity, metrics) and the Article's own internal id, neither of which
+# a public reader has any use for or should see. Never constructed for an
+# article whose episode isn't PUBLISHED -- see
+# ArticleService.get_published_article / list_published_articles.
+
+
+class PublicSourceResponse(BaseModel):
+    start_ms: int
+    end_ms: int
+    text_preview: str
+
+
+class PublicArticleSectionResponse(BaseModel):
+    sequence_number: int
+    heading: str
+    content: str
+    supporting_sources: list[PublicSourceResponse]
+
+
+class PublicArticleResponse(BaseModel):
+    episode_id: uuid.UUID
+    title: str
+    published_at: datetime
+    sections: list[PublicArticleSectionResponse]
+
+    @classmethod
+    def from_models(
+        cls, episode: Episode, article: Article, chunks_by_id: dict[uuid.UUID, Chunk]
+    ) -> "PublicArticleResponse":
+        # Sorted explicitly rather than trusting article.sections' own
+        # order: the relationship's order_by="ArticleSection.sequence_number"
+        # (app/models/article.py) only applies when SQLAlchemy actually
+        # issues the load -- if the same session already has the
+        # collection populated from an earlier write in a different order
+        # (e.g. a caller that just built the article via
+        # ArticleRepository.replace(), whose section list reflects
+        # insertion order, not sequence_number), a later query can return
+        # that already-loaded, wrongly-ordered in-memory list instead of
+        # re-querying. Harmless in real production traffic (each request
+        # gets its own fresh session/identity map) but not a guarantee
+        # worth leaning on for a public response -- sort explicitly here.
+        sections = sorted(article.sections, key=lambda s: s.sequence_number)
+        return cls(
+            episode_id=article.episode_id,
+            title=article.title,
+            published_at=episode.article_published_at,
+            sections=[
+                PublicArticleSectionResponse(
+                    sequence_number=s.sequence_number,
+                    heading=s.heading,
+                    content=s.content,
+                    supporting_sources=[
+                        PublicSourceResponse(
+                            start_ms=chunk.start_ms,
+                            end_ms=chunk.end_ms,
+                            text_preview=chunk.text[:_SOURCE_PREVIEW_CHARS],
+                        )
+                        for cid in s.supporting_chunk_ids
+                        if (chunk := chunks_by_id.get(cid)) is not None
+                    ],
+                )
+                for s in sections
+            ],
+        )
+
+
+class PublicArticleSummaryResponse(BaseModel):
+    episode_id: uuid.UUID
+    title: str
+    published_at: datetime
+
+
+class PublicArticleListResponse(BaseModel):
+    articles: list[PublicArticleSummaryResponse]

@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +63,17 @@ class EpisodeRepository:
     ) -> None:
         episode.status = status
         episode.last_error = last_error
+
+    def mark_published(self, episode: Episode) -> None:
+        """Sets status=PUBLISHED and stamps article_published_at with the
+        current time -- a raw setter, same shape as set_status above.
+        Idempotency (never call this a second time for an
+        already-PUBLISHED episode, so the timestamp never gets bumped
+        forward on a repeat publish call) is the caller's job -- see
+        ArticleService.publish_article."""
+        episode.status = ProcessingStatus.PUBLISHED
+        episode.article_published_at = datetime.now(UTC)
+        episode.last_error = None
 
 
 def _parse_iso_datetime(value: str) -> datetime | None:
