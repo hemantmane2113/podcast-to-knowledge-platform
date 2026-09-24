@@ -25,7 +25,13 @@ async def _client(db_session: AsyncSession) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
-async def _seed_episode_and_transcript(session: AsyncSession) -> tuple[Episode, Transcript]:
+async def _seed_episode_and_transcript(
+    session: AsyncSession,
+    *,
+    title: str | None = None,
+    channel_name: str | None = None,
+    thumbnail_url: str | None = None,
+) -> tuple[Episode, Transcript]:
     # A unique suffix per call -- several tests below seed more than one
     # episode, and youtube_video_id is unique.
     video_id = f"vid{uuid.uuid4().hex[:8]}"
@@ -34,6 +40,9 @@ async def _seed_episode_and_transcript(session: AsyncSession) -> tuple[Episode, 
         youtube_video_id=video_id,
         youtube_url=f"https://www.youtube.com/watch?v={video_id}",
         status=ProcessingStatus.CHUNKING,
+        title=title,
+        channel_name=channel_name,
+        thumbnail_url=thumbnail_url,
     )
     session.add(episode)
     transcript = Transcript(id=uuid.uuid4(), episode_id=episode.id, language="en")
@@ -143,6 +152,9 @@ async def test_public_article_published_is_accessible(db_session: AsyncSession) 
     assert body["title"] == "The Article"
     assert body["published_at"] is not None
     assert len(body["sections"]) == 2
+    # youtube_url is always present (Episode.youtube_url is NOT NULL) --
+    # deterministically the exact stored value, never LLM-generated.
+    assert body["youtube_url"] == episode.youtube_url
 
     # Never exposed: internal article id, validation internals, job data.
     assert "id" not in body
@@ -175,6 +187,61 @@ async def test_public_article_sections_are_returned_in_sequence_order(db_session
     assert [s["sequence_number"] for s in sections] == [0, 1]
     assert sections[0]["heading"] == "First"
     assert sections[1]["heading"] == "Second"
+
+
+async def test_public_article_exposes_episode_source_metadata(db_session: AsyncSession) -> None:
+    """Phase 6: the public response carries the SOURCE video/podcast's own
+    metadata (never fabricated, never LLM-generated) so the frontend can
+    render a standardized "based on the conversation" block -- see
+    app/schemas/article.py::PublicArticleResponse."""
+    episode, transcript = await _seed_episode_and_transcript(
+        db_session,
+        title="The Real Episode Title",
+        channel_name="The Real Channel",
+        thumbnail_url="https://example.com/thumb.jpg",
+    )
+    await _seed_article(db_session, episode, transcript, publish=True)
+
+    client = await _client(db_session)
+    try:
+        response = await client.get(f"/api/v1/articles/{episode.id}")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    # episode_title is the SOURCE video/podcast's own title -- distinct
+    # from `title`, which is the GENERATED article's own title ("The Article").
+    assert body["episode_title"] == "The Real Episode Title"
+    assert body["title"] == "The Article"
+    assert body["channel_name"] == "The Real Channel"
+    assert body["thumbnail_url"] == "https://example.com/thumb.jpg"
+    # The exact stored URL, deterministically -- never reconstructed.
+    assert body["youtube_url"] == episode.youtube_url
+
+
+async def test_public_article_omits_absent_episode_metadata_rather_than_fabricating_it(
+    db_session: AsyncSession,
+) -> None:
+    # No title/channel_name/thumbnail_url given -- ingestion metadata isn't
+    # always fully populated. Must come through as null, never invented.
+    episode, transcript = await _seed_episode_and_transcript(db_session)
+    await _seed_article(db_session, episode, transcript, publish=True)
+
+    client = await _client(db_session)
+    try:
+        response = await client.get(f"/api/v1/articles/{episode.id}")
+    finally:
+        app.dependency_overrides.clear()
+        await client.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["episode_title"] is None
+    assert body["channel_name"] is None
+    assert body["thumbnail_url"] is None
+    assert body["youtube_url"] == episode.youtube_url
 
 
 # --- GET /articles (list) -----------------------------------------------------------------

@@ -493,9 +493,9 @@ def _fake_llm_provider() -> FakeLLMProvider:
                 ],
                 conclusion_summary="c",
             ),
-            GeneratedSection(heading="Intro", content=" ".join(["intro"] + ["word"] * 149)),
-            GeneratedSection(heading="Body", content=" ".join(["body"] + ["word"] * 149)),
-            GeneratedSection(heading="Conclusion", content=" ".join(["conclusion"] + ["word"] * 149)),
+            GeneratedSection(heading="Intro", paragraphs=[" ".join(["intro"] + ["word"] * 149)]),
+            GeneratedSection(heading="Body", paragraphs=[" ".join(["body"] + ["word"] * 149)]),
+            GeneratedSection(heading="Conclusion", paragraphs=[" ".join(["conclusion"] + ["word"] * 149)]),
         ]
     )
 
@@ -748,7 +748,7 @@ async def test_generate_article_retry_resumes_from_already_persisted_sections(
                 ],
                 conclusion_summary="c",
             ),
-            GeneratedSection(heading="Intro", content=" ".join(["intro"] + ["word"] * 149)),
+            GeneratedSection(heading="Intro", paragraphs=[" ".join(["intro"] + ["word"] * 149)]),
             LLMProviderTransientError("transient failure generating Body"),
         ]
     )
@@ -765,8 +765,8 @@ async def test_generate_article_retry_resumes_from_already_persisted_sections(
 
     attempt_2_llm = FakeLLMProvider(
         structured_responses=[
-            GeneratedSection(heading="Body", content=" ".join(["body"] + ["word"] * 149)),
-            GeneratedSection(heading="Conclusion", content=" ".join(["conclusion"] + ["word"] * 149)),
+            GeneratedSection(heading="Body", paragraphs=[" ".join(["body"] + ["word"] * 149)]),
+            GeneratedSection(heading="Conclusion", paragraphs=[" ".join(["conclusion"] + ["word"] * 149)]),
         ]
     )
     await generate_article({"job_try": 2, "llm_provider": attempt_2_llm}, str(episode.id), str(job.id))

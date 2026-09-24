@@ -4,7 +4,7 @@ a very long transcript."""
 
 import logging
 
-from app.ai.prompts import planning_prompt
+from app.ai.prompts import EpisodeContext, planning_prompt
 from app.ai.schemas import ArticlePlanResult
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.article_plan import ArticlePlan
@@ -49,12 +49,18 @@ def build(deps: PipelineDeps):
         topics = state["topics"]
         topics_by_sequence = {t.sequence_number: t for t in topics}
 
+        episode_context = (
+            EpisodeContext(title=episode.title, channel_name=episode.channel_name)
+            if episode is not None
+            else None
+        )
         system, user = planning_prompt(
             topics,
             target_section_count_min=deps.settings.section_count_target_min,
             target_section_count_max=deps.settings.section_count_target_max,
             target_word_count_min=deps.settings.article_target_word_count_min,
             target_word_count_max=deps.settings.article_target_word_count_max,
+            episode_context=episode_context,
         )
         result: ArticlePlanResult = await deps.llm_provider.generate_structured(
             messages=[LLMMessage(role="user", content=user)],

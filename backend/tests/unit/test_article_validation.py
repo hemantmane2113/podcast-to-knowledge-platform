@@ -9,6 +9,7 @@ from app.services.article_validation import (
     PASS,
     WARNING,
     check_article_length,
+    check_attribution_phrase_density,
     check_broken_provenance_chain,
     check_broken_timestamp_references,
     check_excessive_phrase_repetition,
@@ -17,6 +18,7 @@ from app.services.article_validation import (
     check_no_duplicate_sections,
     check_no_empty_sections,
     check_no_missing_planned_sections,
+    check_repeated_paragraph_openings,
     check_repeated_section_openings,
     check_section_count,
     check_similar_sections,
@@ -652,7 +654,103 @@ def test_similar_sections_warns_for_substantial_partial_overlap() -> None:
     assert result.sections == (0, 1)
 
 
-# --- run_validation: full integration of all 15 checks -------------------------------------
+# --- repeated paragraph-opening patterns (article-wide, paragraph granularity) ------------
+
+
+def test_repeated_paragraph_openings_passes_when_too_few_paragraphs() -> None:
+    # Only 3 paragraphs total (below _PARAGRAPH_OPENING_MIN_PARAGRAPHS) --
+    # even an identical opening across all of them isn't a meaningful
+    # signal yet, so this must PASS regardless of the repetition.
+    paragraphs = [
+        "That is exactly why the mechanism functions well over long stretches of time.",
+        "That is exactly how the training regimen builds durable strength over months.",
+        "That is exactly what separates casual practice from deliberate practice routines.",
+    ]
+    result = check_repeated_paragraph_openings([_section(content="\n\n".join(paragraphs))])
+    assert result.passed
+    assert result.severity == PASS
+
+
+def test_repeated_paragraph_openings_passes_for_an_occasional_legitimate_repeat() -> None:
+    # 12 paragraphs, only 2 of which share an opening -- well under the
+    # scaled threshold, and a normal amount of incidental repetition.
+    paragraphs = [
+        "That is exactly why the mechanism functions well over long stretches of time.",
+        "That is exactly how the training regimen builds durable strength over months.",
+        "A different idea appears here about nutrition and its wide-ranging effects.",
+        "Another concept touches on sleep quality and measurable daily improvements.",
+        "A separate consideration covers circadian rhythms and long-term hormonal balance.",
+        "The closing thought ties every earlier idea together for the reader.",
+        "Yet another angle considers stress management and its downstream effects.",
+        "A further point addresses hydration and its role in recovery.",
+        "One more idea concerns morning routines and their lasting impact.",
+        "A later paragraph turns to social support and its protective value.",
+        "An additional thread examines light exposure and its hormonal signaling.",
+        "The final paragraph draws every earlier thread together for the reader.",
+    ]
+    result = check_repeated_paragraph_openings([_section(content="\n\n".join(paragraphs))])
+    assert result.passed
+    assert result.severity == PASS
+
+
+def test_repeated_paragraph_openings_warns_for_an_obvious_repeat() -> None:
+    # 8 paragraphs, 4 of which open with a near-identical "That is exactly
+    # ..." construction -- the exact "That...", "That...", "That...",
+    # "That..." pattern this check exists to catch.
+    paragraphs = [
+        "That is exactly why the mechanism functions well over long stretches of time.",
+        "That is exactly how the training regimen builds durable strength over months.",
+        "That is exactly what separates casual practice from deliberate practice routines.",
+        "That is exactly the reason the recovery period matters as much as effort.",
+        "A different idea appears here about nutrition and its wide-ranging effects.",
+        "Another concept touches on sleep quality and measurable daily improvements.",
+        "A separate consideration covers circadian rhythms and long-term hormonal balance.",
+        "The closing thought ties every earlier idea together for the reader.",
+    ]
+    result = check_repeated_paragraph_openings([_section(content="\n\n".join(paragraphs))])
+    assert result.passed  # WARNING, not FAILURE
+    assert result.severity == WARNING
+    assert result.metrics["largest_group_size"] == 4
+
+
+# --- excessive attribution-phrase density (article-wide) ----------------------------------
+
+
+def test_attribution_phrase_density_passes_for_normal_attribution() -> None:
+    content = "Alice says something important. " + " ".join(["filler"] * 296)  # 300 words total
+    result = check_attribution_phrase_density([_section(content=content)])
+    assert result.passed
+    assert result.severity == PASS
+
+
+def test_attribution_phrase_density_passes_when_article_too_short() -> None:
+    # Below _ATTRIBUTION_MIN_ARTICLE_WORDS -- a density estimate isn't
+    # meaningful yet, even with heavy repetition.
+    content = " ".join(["Alice says something."] * 10)  # 30 words
+    result = check_attribution_phrase_density([_section(content=content)])
+    assert result.passed
+    assert result.severity == PASS
+
+
+def test_attribution_phrase_density_warns_for_clearly_excessive_density() -> None:
+    content = " ".join(["Alice says something specific about it."] * 70)  # 350 words, "says" x70
+    result = check_attribution_phrase_density([_section(content=content)])
+    assert result.passed  # WARNING, not FAILURE
+    assert result.severity == WARNING
+    assert result.metrics["total_attribution_occurrences"] >= 70
+
+
+def test_attribution_phrase_density_never_suggests_removing_attribution() -> None:
+    # The WARNING's own details text must never read as an instruction to
+    # drop attribution -- only to vary its construction (see
+    # app/ai/prompts.py::section_generation_prompt's ATTRIBUTION guidance).
+    content = " ".join(["Alice says something specific about it."] * 70)
+    result = check_attribution_phrase_density([_section(content=content)])
+    assert "remove" not in result.details.lower()
+    assert "drop" not in result.details.lower()
+
+
+# --- run_validation: full integration of all 17 checks -------------------------------------
 
 
 def test_run_validation_passes_for_a_well_formed_article() -> None:
@@ -684,7 +782,7 @@ def test_run_validation_passes_for_a_well_formed_article() -> None:
     )
 
     assert report.passed
-    assert len(report.checks) == 15
+    assert len(report.checks) == 17
     assert all(c.passed for c in report.checks)
 
 
@@ -784,5 +882,5 @@ def test_validation_report_to_json_round_trips_check_shape() -> None:
         max_sections=20,
     )
     payload = report.to_json()
-    assert len(payload) == 15
+    assert len(payload) == 17
     assert all({"name", "passed", "severity", "details", "sections", "metrics"} <= set(entry) for entry in payload)

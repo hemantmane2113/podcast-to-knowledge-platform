@@ -9,6 +9,9 @@ budget, or a check whose details mention two different sections).
 import uuid
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
+
 from app.ai.graph import _should_revise
 from app.ai.nodes.revision import _sections_needing_revision
 from app.ai.nodes.section_generation import (
@@ -26,7 +29,7 @@ from app.ai.nodes.topic_analysis import (
     _reconstruct_topics,
 )
 from app.ai.nodes.validation import _editorial_review
-from app.ai.prompts import article_editorial_review_prompt, section_generation_prompt
+from app.ai.prompts import EpisodeContext, article_editorial_review_prompt, planning_prompt, section_generation_prompt
 from app.ai.schemas import (
     ArticleEditorialReview,
     GeneratedSection,
@@ -588,7 +591,7 @@ async def test_generate_section_includes_relevant_topic_knowledge_but_excludes_i
     )
     deps = SimpleNamespace(
         llm_provider=FakeLLMProvider(
-            structured_responses=[GeneratedSection(heading="Section A", content="generated prose")]
+            structured_responses=[GeneratedSection(heading="Section A", paragraphs=["generated prose"])]
         )
     )
 
@@ -629,7 +632,7 @@ async def test_generate_section_omits_topic_notes_block_when_no_topics_are_relev
     )
     deps = SimpleNamespace(
         llm_provider=FakeLLMProvider(
-            structured_responses=[GeneratedSection(heading="Section A", content="prose")]
+            structured_responses=[GeneratedSection(heading="Section A", paragraphs=["prose"])]
         )
     )
 
@@ -1075,7 +1078,7 @@ async def test_generate_section_forwards_narrative_and_already_covered_context_t
     planned_section["transition_from_previous"] = "Because the claim was just established."
     deps = SimpleNamespace(
         llm_provider=FakeLLMProvider(
-            structured_responses=[GeneratedSection(heading="Body", content="prose")]
+            structured_responses=[GeneratedSection(heading="Body", paragraphs=["prose"])]
         )
     )
 
@@ -1116,13 +1119,256 @@ async def test_generate_section_omits_narrative_fields_absent_from_planned_secti
     assert "narrative_purpose" not in planned_section  # confirms the premise
     deps = SimpleNamespace(
         llm_provider=FakeLLMProvider(
-            structured_responses=[GeneratedSection(heading="Intro", content="prose")]
+            structured_responses=[GeneratedSection(heading="Intro", paragraphs=["prose"])]
         )
     )
 
     await generate_section(  # must not raise
         deps, planned_section, {chunk.id: chunk}, {}, article_title="T", section_headings=["Intro"]
     )
+
+
+# --- GeneratedSection.paragraphs (app/ai/schemas.py) ---------------------------------------
+
+
+def test_generated_section_strips_and_drops_blank_paragraphs() -> None:
+    section = GeneratedSection(heading="H", paragraphs=["  first paragraph  ", "", "   ", "second paragraph"])
+    assert section.paragraphs == ["first paragraph", "second paragraph"]
+
+
+def test_generated_section_rejects_all_blank_paragraphs() -> None:
+    with pytest.raises(ValidationError):
+        GeneratedSection(heading="H", paragraphs=["", "   ", "\n"])
+
+
+# --- paragraph persistence: GeneratedSection.paragraphs -> ArticleSection.content ("\n\n"-joined) ---
+
+
+async def test_generate_section_persists_paragraphs_joined_by_blank_line() -> None:
+    chunk = _chunk("raw text", 0)
+    planned_section = _planned_section(
+        sequence_number=0, heading="Intro", supporting_chunk_ids=[chunk.id], supporting_topic_ids=[]
+    )
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[
+                GeneratedSection(heading="Intro", paragraphs=["First paragraph.", "Second paragraph."])
+            ]
+        )
+    )
+
+    candidate = await generate_section(
+        deps, planned_section, {chunk.id: chunk}, {}, article_title="T", section_headings=["Intro"]
+    )
+
+    assert candidate.content == "First paragraph.\n\nSecond paragraph."
+
+
+# --- episode context threading (Phase 5): EpisodeContext -> planning_prompt / section_generation_prompt ---
+
+
+def test_planning_prompt_includes_podcast_context_when_given() -> None:
+    _, user = planning_prompt(
+        [],
+        target_section_count_min=4,
+        target_section_count_max=8,
+        target_word_count_min=1000,
+        target_word_count_max=2000,
+        episode_context=EpisodeContext(title="The Real Episode Title", channel_name="The Real Channel"),
+    )
+    assert "The Real Episode Title" in user
+    assert "The Real Channel" in user
+
+
+def test_planning_prompt_omits_podcast_context_block_when_none_given() -> None:
+    _, user = planning_prompt(
+        [],
+        target_section_count_min=4,
+        target_section_count_max=8,
+        target_word_count_min=1000,
+        target_word_count_max=2000,
+    )
+    assert "PODCAST CONTEXT" not in user
+
+
+def test_planning_prompt_allows_brief_guest_context_but_forbids_a_standalone_biography() -> None:
+    system, _ = planning_prompt(
+        [],
+        target_section_count_min=4,
+        target_section_count_max=8,
+        target_word_count_min=1000,
+        target_word_count_max=2000,
+    )
+    assert "Do not plan a standalone" in system
+    assert "biography section" in system
+    # Still permits a brief, supported mention inside the opening -- never
+    # a blanket "no biography at all" instruction.
+    assert "brief one-to-two-sentence mention" in system
+    assert "Never invent credentials" in system
+
+
+def test_section_generation_prompt_includes_podcast_context_when_given() -> None:
+    _, user = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+        episode_context=EpisodeContext(title="The Real Episode Title", channel_name="The Real Channel"),
+    )
+    assert "The Real Episode Title" in user
+    assert "The Real Channel" in user
+
+
+def test_section_generation_prompt_omits_podcast_context_block_when_none_given() -> None:
+    _, user = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert "PODCAST CONTEXT" not in user
+
+
+async def test_generate_section_forwards_episode_context_to_the_prompt() -> None:
+    chunk = _chunk("raw text", 0)
+    planned_section = _planned_section(
+        sequence_number=0, heading="Intro", supporting_chunk_ids=[chunk.id], supporting_topic_ids=[]
+    )
+    deps = SimpleNamespace(
+        llm_provider=FakeLLMProvider(
+            structured_responses=[GeneratedSection(heading="Intro", paragraphs=["prose"])]
+        )
+    )
+
+    await generate_section(
+        deps,
+        planned_section,
+        {chunk.id: chunk},
+        {},
+        article_title="T",
+        section_headings=["Intro"],
+        episode_context=EpisodeContext(title="The Real Episode Title", channel_name="The Real Channel"),
+    )
+
+    messages, _, _ = deps.llm_provider.structured_calls[0]
+    assert "The Real Episode Title" in messages[0].content
+    assert "The Real Channel" in messages[0].content
+
+
+# --- Phase 4 editorial rewrite: paragraph structure / openings / transitions / attribution / bullets ---
+
+
+def test_section_generation_prompt_system_covers_paragraph_structure_guidance() -> None:
+    system, _ = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert "PARAGRAPH STRUCTURE" in system
+    assert "PARAGRAPH OPENINGS" in system
+    assert "PARAGRAPH-TO-PARAGRAPH TRANSITIONS" in system
+    assert "ATTRIBUTION" in system
+    assert "EVIDENCE, OPINION, AND SPECULATION" in system
+    assert "BULLETS" in system
+
+
+def test_section_generation_prompt_warns_against_repeated_paragraph_openings() -> None:
+    system, _ = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert '"That"' in system
+    assert "Do not repeatedly begin paragraphs with the same word or construction" in system
+
+
+def test_section_generation_prompt_instructs_varying_attribution_never_dropping_it() -> None:
+    system, _ = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert "never solve repeated attribution by dropping it" in system
+
+
+def test_section_generation_prompt_scopes_bullets_to_genuine_multi_step_material() -> None:
+    system, _ = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert "most sections should have no bullets at all" in system
+    assert "multi-step framework" in system
+    assert "use a list just to make the section look shorter" in system
+
+
+def test_section_generation_prompt_preserves_claim_type_distinctions() -> None:
+    system, _ = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+    )
+    assert "Never convert a speaker's speculation or hypothesis into established fact" in system
+    assert "never invent an external" in system
+    assert "scientific consensus" in system
+
+
+def test_section_generation_prompt_first_section_permits_brief_supported_guest_mention() -> None:
+    system, user = section_generation_prompt(
+        heading="Intro",
+        key_ideas=[],
+        viewpoints=[],
+        attribution_notes=[],
+        supporting_chunks=[],
+        relevant_topics=[],
+        article_title="T",
+        section_headings=["Intro"],
+        current_section_number=0,
+        introduction_summary="the central tension is X",
+    )
+    assert "Do not write a standalone biography of the guest" in user
+    assert "brief one-to-two-sentence mention" in user
+    assert "invented credentials" in user
 
 
 # --- Batch 5 (editorial revision/compression): _should_revise, the editorial review call, and its prompt ---

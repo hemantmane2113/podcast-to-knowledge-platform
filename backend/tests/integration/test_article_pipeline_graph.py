@@ -69,7 +69,7 @@ def _chunks() -> list[Chunk]:
 
 
 def _good_section(heading: str = "Introduction") -> GeneratedSection:
-    return GeneratedSection(heading=heading, content=" ".join(["word"] * 150))
+    return GeneratedSection(heading=heading, paragraphs=[" ".join(["word"] * 150)])
 
 
 async def test_pipeline_persists_topics_plan_article_and_passing_validation(
@@ -130,7 +130,7 @@ async def test_pipeline_revises_a_failing_section_until_it_passes(db_session: As
                 sections=[PlannedSection(heading="Introduction", supporting_topic_sequence_numbers=[0])],
                 conclusion_summary="c",
             ),
-            GeneratedSection(heading="Introduction", content="too short"),  # fails no_empty_sections
+            GeneratedSection(heading="Introduction", paragraphs=["too short"]),  # fails no_empty_sections
             _good_section(),  # the revision's regenerated section
         ]
     )
@@ -149,7 +149,7 @@ async def test_pipeline_revises_a_failing_section_until_it_passes(db_session: As
 
     assert final_state["validation_report"].passed
     assert final_state["revision_count"] == 1
-    assert final_state["article"].sections[0].content == _good_section().content
+    assert final_state["article"].sections[0].content == "\n\n".join(_good_section().paragraphs)
 
 
 async def test_pipeline_stops_after_max_revision_attempts_even_if_still_failing(
@@ -158,7 +158,7 @@ async def test_pipeline_stops_after_max_revision_attempts_even_if_still_failing(
     episode, transcript = await _seed(db_session)
     chunks = _chunks()
 
-    always_bad = GeneratedSection(heading="Introduction", content="too short")
+    always_bad = GeneratedSection(heading="Introduction", paragraphs=["too short"])
     llm = FakeLLMProvider(
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
@@ -205,12 +205,15 @@ async def test_pipeline_passes_narrative_context_and_already_covered_material_to
     episode, transcript = await _seed(db_session)
     chunks = _chunks()
 
-    def _section_content(tail_marker: str) -> str:
-        # Distinct lead text per section (not just the tail) -- identical
+    def _section_content(tail_marker: str) -> list[str]:
+        # Two distinct paragraphs (not just distinct tails) -- identical
         # filler paragraphs across sections would otherwise legitimately
         # trip check_no_duplicate_paragraphs and force an unplanned
         # revision round this test isn't set up for.
-        return f"Lead paragraph {tail_marker}. " + " ".join(["word"] * 140) + f"\n\nClosing thought {tail_marker}."
+        return [
+            f"Lead paragraph {tail_marker}. " + " ".join(["word"] * 140),
+            f"Closing thought {tail_marker}.",
+        ]
 
     llm = FakeLLMProvider(
         structured_responses=[
@@ -243,9 +246,9 @@ async def test_pipeline_passes_narrative_context_and_already_covered_material_to
                 ],
                 conclusion_summary="synthesis Y",
             ),
-            GeneratedSection(heading="Intro", content=_section_content("TAIL0")),
-            GeneratedSection(heading="Body", content=_section_content("TAIL1")),
-            GeneratedSection(heading="Conclusion", content=_section_content("TAIL2")),
+            GeneratedSection(heading="Intro", paragraphs=_section_content("TAIL0")),
+            GeneratedSection(heading="Body", paragraphs=_section_content("TAIL1")),
+            GeneratedSection(heading="Conclusion", paragraphs=_section_content("TAIL2")),
         ]
     )
     deps = PipelineDeps(session=db_session, llm_provider=llm, settings=_settings(section_count_min=1))
@@ -397,8 +400,8 @@ async def test_editorial_review_targets_only_flagged_sections_and_preserves_prov
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
             _two_section_plan(),
-            GeneratedSection(heading="Intro", content=intro_content),
-            GeneratedSection(heading="Body", content=body_content),
+            GeneratedSection(heading="Intro", paragraphs=[intro_content]),
+            GeneratedSection(heading="Body", paragraphs=[body_content]),
             # First validation pass: deterministic checks pass (nothing
             # section-specific to fix), but the editorial review flags
             # section 1 (Body) on its own -- the only way an article-level
@@ -411,7 +414,7 @@ async def test_editorial_review_targets_only_flagged_sections_and_preserves_prov
                     SectionEditorialFeedback(sequence_number=1, feedback="don't re-explain, add a new angle")
                 ],
             ),
-            GeneratedSection(heading="Body", content=revised_body_content),
+            GeneratedSection(heading="Body", paragraphs=[revised_body_content]),
             # Second validation pass (after revision): editorial review now
             # finds nothing wrong -> loop ends.
             ArticleEditorialReview(coherent=True, notes="reads well now", sections_needing_revision=[]),
@@ -487,8 +490,8 @@ async def test_editorial_review_prevents_uniform_regeneration_on_a_section_less_
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
             _two_section_plan(),
-            GeneratedSection(heading="Intro", content=intro_content),
-            GeneratedSection(heading="Body", content=body_content),
+            GeneratedSection(heading="Intro", paragraphs=[intro_content]),
+            GeneratedSection(heading="Body", paragraphs=[body_content]),
             # First validation pass: article is 300 words against a
             # transcript_word_count of 500 -> 60% > the 40% ratio ceiling,
             # so check_article_length fails with NO section number in its
@@ -500,7 +503,7 @@ async def test_editorial_review_prevents_uniform_regeneration_on_a_section_less_
                     SectionEditorialFeedback(sequence_number=1, feedback="cut the padding")
                 ],
             ),
-            GeneratedSection(heading="Body", content=revised_body_content),
+            GeneratedSection(heading="Body", paragraphs=[revised_body_content]),
             # Second validation pass: still over length (only one section
             # shrank), but revision_count(1) >= max_revision_attempts(1)
             # stops the loop regardless of this call's content.
@@ -545,8 +548,8 @@ async def test_editorial_review_flagging_nothing_does_not_trigger_an_unnecessary
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
             _two_section_plan(),
-            GeneratedSection(heading="Intro", content="Intro opening. " + " ".join(["word"] * 148)),
-            GeneratedSection(heading="Body", content="Body opening. " + " ".join(["filler"] * 148)),
+            GeneratedSection(heading="Intro", paragraphs=["Intro opening. " + " ".join(["word"] * 148)]),
+            GeneratedSection(heading="Body", paragraphs=["Body opening. " + " ".join(["filler"] * 148)]),
             # Deterministic checks pass, and the editorial review finds
             # nothing wrong either -> the loop must end after exactly one
             # editorial review call, with zero revision rounds.
@@ -583,8 +586,8 @@ async def test_editorial_review_disabled_by_default_adds_no_llm_call_and_no_edit
         structured_responses=[
             TopicAnalysisResult(topics=[TopicItem(title="Topic A", summary="s", chunk_sequence_numbers=[0, 1])]),
             _two_section_plan(),
-            GeneratedSection(heading="Intro", content="Intro opening. " + " ".join(["word"] * 148)),
-            GeneratedSection(heading="Body", content="Body opening. " + " ".join(["filler"] * 148)),
+            GeneratedSection(heading="Intro", paragraphs=["Intro opening. " + " ".join(["word"] * 148)]),
+            GeneratedSection(heading="Body", paragraphs=["Body opening. " + " ".join(["filler"] * 148)]),
             # Deliberately NO editorial-review response programmed --
             # enable_llm_validation defaults to False, so _editorial_review
             # must return None without ever calling generate_structured.

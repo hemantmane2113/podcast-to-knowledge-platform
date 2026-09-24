@@ -32,6 +32,7 @@ from app.ai.nodes.section_generation import (
     order_plan_sections,
     section_word_target,
 )
+from app.ai.prompts import EpisodeContext
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.episode import ProcessingStatus
 from app.repositories.article_repository import ArticleSectionCandidate
@@ -84,6 +85,12 @@ def build(deps: PipelineDeps):
             if editorial_review.overall_feedback:
                 shared_feedback.append(f"editorial_review: {editorial_review.overall_feedback}")
 
+        episode_context = (
+            EpisodeContext(title=episode.title, channel_name=episode.channel_name)
+            if episode is not None
+            else None
+        )
+
         plan = state["plan"]
         chunk_by_id = {c.id: c for c in state["chunks"]}
         topic_by_id = {t.id: t for t in state["topics"]}
@@ -134,6 +141,7 @@ def build(deps: PipelineDeps):
                         target_word_count_min=word_target_min,
                         target_word_count_max=word_target_max,
                         revision_feedback="; ".join(feedback_parts) or None,
+                        episode_context=episode_context,
                     )
                 )
             else:

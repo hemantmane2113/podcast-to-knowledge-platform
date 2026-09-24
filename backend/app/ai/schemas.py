@@ -10,7 +10,7 @@ ever asks the model to invent or transcribe an ID.
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TopicClaim(BaseModel):
@@ -106,8 +106,29 @@ class ArticlePlanResult(BaseModel):
 
 
 class GeneratedSection(BaseModel):
+    """An ephemeral LLM output schema -- never persisted directly.
+    app/ai/nodes/section_generation.py joins `paragraphs` with "\\n\\n"
+    into ArticleSection.content (a single Text column, unchanged) at the
+    persistence boundary, so this shape change requires no migration and
+    no change to how content is stored or read back.
+
+    `paragraphs` (one string per paragraph) replaces a single opaque
+    `content` blob so paragraph boundaries are an explicit part of the
+    model's own output -- rather than inferred after the fact from
+    "\\n\\n" -- which is what app/services/article_validation.py's
+    paragraph-level checks (check_no_duplicate_paragraphs,
+    check_repeated_paragraph_openings) rely on."""
+
     heading: str
-    content: str
+    paragraphs: list[str]
+
+    @field_validator("paragraphs")
+    @classmethod
+    def _paragraphs_are_non_empty_prose(cls, value: list[str]) -> list[str]:
+        cleaned = [p.strip() for p in value if p.strip()]
+        if not cleaned:
+            raise ValueError("paragraphs must contain at least one non-empty paragraph")
+        return cleaned
 
 
 class SectionEditorialFeedback(BaseModel):

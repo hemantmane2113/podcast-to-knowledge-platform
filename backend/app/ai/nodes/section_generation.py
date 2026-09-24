@@ -18,7 +18,7 @@ attempt; only the remaining, still-missing sections are ever regenerated.
 import logging
 import uuid
 
-from app.ai.prompts import section_generation_prompt
+from app.ai.prompts import EpisodeContext, section_generation_prompt
 from app.ai.schemas import GeneratedSection
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config.settings import Settings
@@ -133,6 +133,7 @@ async def generate_section(
     target_word_count_min: int | None = None,
     target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
+    episode_context: EpisodeContext | None = None,
 ) -> ArticleSectionCandidate:
     supporting_chunk_ids = [uuid.UUID(cid) for cid in planned_section.get("supporting_chunk_ids", [])]
     supporting_topic_ids = [uuid.UUID(tid) for tid in planned_section.get("supporting_topic_ids", [])]
@@ -165,6 +166,7 @@ async def generate_section(
         target_word_count_min=target_word_count_min,
         target_word_count_max=target_word_count_max,
         revision_feedback=revision_feedback,
+        episode_context=episode_context,
     )
     result: GeneratedSection = await deps.llm_provider.generate_structured(
         messages=[LLMMessage(role="user", content=user)],
@@ -175,7 +177,7 @@ async def generate_section(
     return ArticleSectionCandidate(
         sequence_number=planned_section["sequence_number"],
         heading=result.heading,
-        content=result.content,
+        content="\n\n".join(result.paragraphs),
         supporting_chunk_ids=supporting_chunk_ids,
         supporting_topic_ids=supporting_topic_ids,
     )
@@ -187,6 +189,12 @@ def build(deps: PipelineDeps):
         if episode is not None:
             deps.episodes.set_status(episode, ProcessingStatus.GENERATING)
             await deps.session.commit()
+
+        episode_context = (
+            EpisodeContext(title=episode.title, channel_name=episode.channel_name)
+            if episode is not None
+            else None
+        )
 
         plan = state["plan"]
         chunk_by_id = {c.id: c for c in state["chunks"]}
@@ -242,6 +250,7 @@ def build(deps: PipelineDeps):
                 next_narrative_purpose=next_section_narrative_purpose(ordered_sections, seq),
                 target_word_count_min=word_target_min,
                 target_word_count_max=word_target_max,
+                episode_context=episode_context,
             )
             # Persisted (and committed) immediately after this section's
             # own LLM call succeeds -- a failed/raising call never reaches

@@ -4,9 +4,32 @@ non-reusable-across-providers strings and that dependency would buy
 nothing here (see ARCHITECTURE.md's "no premature infrastructure").
 """
 
+from dataclasses import dataclass
+
 from app.ai.schemas import TopicItem
 from app.models.chunk import Chunk
 from app.models.topic import Topic
+
+
+@dataclass(frozen=True)
+class EpisodeContext:
+    """Deterministic episode metadata threaded into planning_prompt and
+    section_generation_prompt purely for grounding -- always built from
+    the stored Episode row (app/models/episode.py), never from the model.
+    Both fields are optional since ingestion may not have captured them
+    yet; a missing field is simply omitted from the prompt, never
+    fabricated.
+
+    Deliberately does NOT carry youtube_url: the URL belongs only to the
+    deterministic public-article response/frontend layer
+    (app/schemas/article.py::PublicArticleResponse), never to anything
+    the model sees or could reconstruct/mangle in prose -- see
+    Settings/PHASE 5's "do not let the LLM generate or reconstruct URLs".
+    """
+
+    title: str | None = None
+    channel_name: str | None = None
+
 
 FIDELITY_CONSTRAINTS = """\
 Ground everything you write ONLY in the transcript excerpts provided below. Follow these rules strictly:
@@ -92,6 +115,7 @@ def planning_prompt(
     target_section_count_max: int,
     target_word_count_min: int,
     target_word_count_max: int,
+    episode_context: EpisodeContext | None = None,
 ) -> tuple[str, str]:
     system = (
         "You are planning a knowledge article that turns a long-form podcast conversation into a "
@@ -135,15 +159,25 @@ def planning_prompt(
         "Preserve important disagreements/contrasting viewpoints as their own planning notes so the "
         "writer doesn't flatten them later. Decide a sensible title, introduction, section ordering, and "
         "conclusion. The introduction should establish the central question or tension the conversation "
-        "explores and give the reader a genuine reason to keep reading -- not a biography of the "
-        "speakers unless the biography itself is directly relevant. The conclusion should return to that "
-        "same central question and offer a synthesis, not a restatement of every section in order, and "
-        "should not introduce a new major topic just because the conversation happened to cover it "
-        "late.\n\n"
+        "explores and give the reader a genuine reason to keep reading. Do not plan a standalone "
+        "biography section merely to introduce a guest -- if who the guest is or their background is "
+        "actually relevant to why their perspective matters, and is supported by the conversation or "
+        "the podcast context given below, a brief one-to-two-sentence mention belongs naturally inside "
+        "the opening section, not a section of its own. Never invent credentials, achievements, "
+        "affiliations, or biographical detail that isn't actually supported by what you're given -- if "
+        "you don't have it, leave it out rather than guessing. The conversation itself is always the "
+        "priority; guest context is a small addition to it, never the article's focus. The conclusion "
+        "should return to that same central question and offer a synthesis, not a restatement of every "
+        "section in order, and should not introduce a new major topic just because the conversation "
+        "happened to cover it late.\n\n"
         "For every section you should be able to answer: what does the reader know after it that they "
         "didn't before, why does it come at this point rather than earlier or later, and what makes "
         "them want to keep reading into the next one -- narrative_purpose and transition_from_previous "
-        "are where those answers belong.\n\n"
+        "are where those answers belong. Write transition_from_previous specifically enough that "
+        "whoever writes this section's actual prose could open with a real sentence expressing that "
+        "relationship, not just know that some relationship exists -- name the kind of connection (a "
+        "consequence, a complication, a contrast, a deeper layer of the same idea, an example, a "
+        "resolution) rather than a vague \"this follows the previous section\".\n\n"
         f"Aim for approximately {target_section_count_min}-{target_section_count_max} sections for a "
         "conversation of this length -- fewer is fine if the conversation genuinely covers less ground, "
         "and more is fine if it genuinely needs it, but never split or merge sections merely to hit a "
@@ -158,7 +192,16 @@ def planning_prompt(
         f"Key claims: {'; '.join(c.get('text', '') for c in t.key_claims) or '(none)'}"
         for t in topics
     )
+    context_block = ""
+    if episode_context and (episode_context.title or episode_context.channel_name):
+        context_lines = ["PODCAST CONTEXT (factual, given -- never embellish or add to it):"]
+        if episode_context.title:
+            context_lines.append(f"Episode/video title: {episode_context.title}")
+        if episode_context.channel_name:
+            context_lines.append(f"Channel/show: {episode_context.channel_name}")
+        context_block = "\n".join(context_lines) + "\n\n"
     user = (
+        f"{context_block}"
         f"Topics identified in the conversation:\n\n{topic_lines}\n\n"
         "Produce an article plan. For each section, list the topic numbers (exactly as given above, "
         "e.g. \"topic 3\" -> the integer 3) it should draw on."
@@ -209,8 +252,13 @@ def section_generation_prompt(
     target_word_count_min: int | None = None,
     target_word_count_max: int | None = None,
     revision_feedback: str | None = None,
+    episode_context: EpisodeContext | None = None,
 ) -> tuple[str, str]:
-    """Returns (system, user) for generating one article section.
+    """Returns (system, user) for generating one article section. The
+    response is validated against GeneratedSection (app/ai/schemas.py),
+    whose `paragraphs: list[str]` (not a single `content` blob) makes
+    paragraph boundaries an explicit part of the model's own output --
+    the system prompt below tells the model this directly.
 
     Three kinds of *evidentiary* material, in strictly decreasing
     authority -- see the system prompt below and
@@ -293,21 +341,82 @@ def section_generation_prompt(
         "anecdote its own point of emphasis. Favor concrete examples, meaningful contrasts, genuine "
         "cause-and-effect, unresolved questions, and real implications over clickbait, manufactured "
         "drama, exaggerated claims, generic motivational language, or artificial suspense.\n\n"
-        "Write substantive, precise, concrete prose (not bullet points, not a transcript excerpt) that a "
-        "reader who never heard the podcast could understand on its own -- the minimum prose that "
-        "communicates the assigned ideas clearly and engagingly, not the most you could write. Vary "
-        "paragraph length, sentence structure, and how paragraphs open; do not repeatedly start with "
-        'constructions like "X says", "X explains", or "X argues", but never drop attribution simply to '
-        "vary the prose -- stay clear about whether you're reporting a claim, evidence, personal "
-        "experience, interpretation, disagreement, or uncertainty, since dropping attribution can "
-        "quietly turn a speaker's claim into an unqualified fact. Avoid formulaic AI-writing patterns -- "
-        'phrases like "in conclusion", "furthermore", "moreover", "another important aspect", "it is '
-        'important to note", "this highlights the importance of", "in today\'s fast-paced world", or "at '
-        'the end of the day" -- not as a mechanical ban (one may occasionally belong) but because they '
-        "signal generic, templated prose; the goal is writing that doesn't read like a formula."
+        "Write substantive, precise, concrete prose that a reader who never heard the podcast could "
+        "understand on its own -- the minimum prose that communicates the assigned ideas clearly and "
+        "engagingly, not the most you could write.\n\n"
+        "PARAGRAPH STRUCTURE. Your response is a LIST of paragraphs, not one block of text -- you "
+        "decide the paragraph boundaries yourself, and each item you return is exactly one paragraph. "
+        "Prefer paragraphs of roughly 2-5 sentences that each develop ONE connected idea. Split a "
+        "paragraph when the argument changes, a new example begins, a new implication is introduced, "
+        "or the reader would benefit from a breath -- not on a fixed schedule, and not to hit a word "
+        "count. A short paragraph is fine, even good, when it creates emphasis or marks a genuine turn "
+        "in the argument; don't make every paragraph short just for visual effect, and don't let a "
+        "paragraph run on covering two or three separate ideas just because breaking it up felt "
+        "unnecessary.\n\n"
+        "PARAGRAPH OPENINGS. Do not repeatedly begin paragraphs with the same word or construction -- "
+        'watch in particular for starting several paragraphs in the same section with "That", "This", '
+        '"He"/"She", "The", or the speaker\'s name. Any one of these is fine once, where it\'s simply '
+        "the natural way to say the sentence; repeated use across a section is the actual problem, not "
+        "the construction itself. Vary how a paragraph opens based on what that paragraph is actually "
+        'doing -- for example (these illustrate the KIND of variety to aim for, never phrases to reuse '
+        'verbatim): "The distinction matters because...", "That principle becomes more practical '
+        'when...", "The same logic appears in...", "For [speaker], the implication is...", "The '
+        'conversation then moves from...", "What makes this important is...", "The practical '
+        'consequence is...", "There is another side to this...", "This becomes especially relevant '
+        'when...", "At that point, the question shifts...".\n\n'
+        "PARAGRAPH-TO-PARAGRAPH TRANSITIONS. This is distinct from the transition between THIS section "
+        "and the previous one (already covered by this section's own editorial context below) -- this "
+        "is about the paragraphs you write here, next to each other. Not every paragraph needs an "
+        "explicit transition sentence, but consecutive paragraphs should have a clear logical "
+        "relationship that the prose actually expresses -- moving from a principle to an example, an "
+        "example to its implication, a claim to a qualification, a physiological mechanism to the "
+        "behavior it explains, a problem to a proposed solution, an anecdote to the broader lesson it "
+        "illustrates, or a disagreement to how it resolves (or where it stays unresolved). Express that "
+        'relationship through what the sentence actually says, never through generic filler like '
+        '"furthermore", "moreover", or "additionally" used just to glue two paragraphs together.\n\n'
+        "ATTRIBUTION. Preserve who said what -- never solve repeated attribution by dropping it. Vary "
+        'the construction instead of reusing "[speaker] says/explains/argues" every time -- for '
+        'example: "[speaker] argues that...", "his/her explanation centers on...", "in this framing, '
+        '...", "the point [speaker] returns to is...", "[speaker] describes this as...", "according to '
+        '[speaker]\'s account...", "[speaker] distinguishes between...", "the broader argument is..." '
+        "-- again, the kind of variety to aim for, not a fixed script, and not something to apply "
+        "mechanically. Do not attribute every single sentence -- once a paragraph has clearly "
+        "established whose view is being presented, later sentences in that SAME paragraph can use a "
+        "pronoun or a plain statement instead of repeating the attribution, as long as it stays "
+        "unambiguous whose claim it still is.\n\n"
+        "EVIDENCE, OPINION, AND SPECULATION. Where a topic note's claim_type is given (fact / opinion / "
+        "speculation), let it guide how you phrase the claim: state a fact plainly, but keep a stated "
+        'opinion, interpretation, personal experience, or speculation legibly marked as such (e.g. '
+        '"[speaker] suspects..." rather than presenting a hypothesis as settled). Never convert a '
+        "speaker's speculation or hypothesis into established fact, never introduce a degree of "
+        "scientific certainty the source material doesn't support, and never invent an external "
+        "scientific consensus the transcript doesn't actually describe. If the transcript presents "
+        "something as uncertain or contested, keep that uncertainty in your prose.\n\n"
+        "BULLETS. Prose is still the default, and most sections should have no bullets at all. A "
+        "bulleted list is allowed only when the source material itself naturally contains a "
+        "multi-step framework, a discrete set of recommendations, a sequence of actions, clearly "
+        "separable principles, or a compact comparison that a reader would genuinely find easier to "
+        "scan as a list than as a sentence. Introduce a list with a normal sentence rather than "
+        "dropping it in unannounced. Do not convert ordinary narrative prose into bullets, and do not "
+        "use a list just to make the section look shorter or more skimmable.\n\n"
+        "Avoid formulaic AI-writing patterns -- phrases like \"in conclusion\", \"furthermore\", "
+        '"moreover", "another important aspect", "it is important to note", "this highlights the '
+        'importance of", "in today\'s fast-paced world", or "at the end of the day" -- not as a '
+        "mechanical ban (one may occasionally belong) but because they signal generic, templated "
+        "prose. Prioritize clarity and editorial quality over artificial stylistic variation for its "
+        "own sake -- the goal is writing that doesn't read like a formula, not writing that avoids "
+        "every familiar word."
     )
 
-    parts = [f"ARTICLE TITLE:\n{article_title}", "", "ARTICLE STRUCTURE:"]
+    parts = [f"ARTICLE TITLE:\n{article_title}"]
+    if episode_context and (episode_context.title or episode_context.channel_name):
+        context_lines = ["", "PODCAST CONTEXT (factual, given -- never embellish or add to it):"]
+        if episode_context.title:
+            context_lines.append(f"Episode/video title: {episode_context.title}")
+        if episode_context.channel_name:
+            context_lines.append(f"Channel/show: {episode_context.channel_name}")
+        parts.extend(context_lines)
+    parts.extend(["", "ARTICLE STRUCTURE:"])
     for i, sec_heading in enumerate(section_headings):
         marker = "  <-- YOU ARE WRITING THIS SECTION" if i == current_section_number else ""
         parts.append(f"{i + 1}. {sec_heading}{marker}")
@@ -346,8 +455,12 @@ def section_generation_prompt(
         parts.append(
             "\nThis is the ARTICLE'S OPENING SECTION. Beyond the key ideas above, use it to establish "
             "the central question or tension this article explores and give the reader a genuine, "
-            "specific reason to keep reading -- not generic scene-setting, and not a biography of the "
-            "speaker(s) unless directly relevant to that central question. Set the article's narrative "
+            "specific reason to keep reading -- not generic scene-setting. Do not write a standalone "
+            "biography of the guest, but if who they are or their background is genuinely relevant to "
+            "why their perspective matters here, and is supported by the podcast context or source "
+            "material given below, a brief one-to-two-sentence mention of who they are can appear "
+            "naturally as part of this opening -- never invented credentials, achievements, "
+            "affiliations, or background beyond what you're actually given. Set the article's narrative "
             f"direction so later sections read as a natural continuation.\nPlanned introduction intent: "
             f"{introduction_summary}"
         )

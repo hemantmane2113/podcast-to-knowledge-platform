@@ -98,7 +98,7 @@ def _three_section_plan() -> ArticlePlanResult:
 def _generated_section(heading: str, marker: str) -> GeneratedSection:
     # Distinct content per heading (leading marker word) so
     # check_no_duplicate_sections never trips across these fixtures.
-    return GeneratedSection(heading=heading, content=" ".join([marker] + ["word"] * 149))
+    return GeneratedSection(heading=heading, paragraphs=[" ".join([marker] + ["word"] * 149)])
 
 
 async def _seed_topics(session: AsyncSession, episode: Episode, transcript: Transcript, chunks: list[Chunk]):

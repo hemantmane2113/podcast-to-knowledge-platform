@@ -141,6 +141,18 @@ class PublicArticleResponse(BaseModel):
     episode_id: uuid.UUID
     title: str
     published_at: datetime
+    # Source metadata (Episode's own fields, never generated/reconstructed
+    # by the LLM -- see app/ai/prompts.py::EpisodeContext's docstring) so
+    # the frontend can render a standardized "based on the conversation"
+    # block naming the original video/podcast and linking to it. `title`
+    # above stays the GENERATED article's own title; `episode_title` is the
+    # source video/podcast's own title, which commonly differs from it.
+    # All four are nullable exactly as Episode's own columns are (ingestion
+    # metadata isn't always fully populated) -- never fabricated when absent.
+    episode_title: str | None
+    channel_name: str | None
+    youtube_url: str
+    thumbnail_url: str | None
     sections: list[PublicArticleSectionResponse]
 
     @classmethod
@@ -164,6 +176,10 @@ class PublicArticleResponse(BaseModel):
             episode_id=article.episode_id,
             title=article.title,
             published_at=episode.article_published_at,
+            episode_title=episode.title,
+            channel_name=episode.channel_name,
+            youtube_url=episode.youtube_url,
+            thumbnail_url=episode.thumbnail_url,
             sections=[
                 PublicArticleSectionResponse(
                     sequence_number=s.sequence_number,

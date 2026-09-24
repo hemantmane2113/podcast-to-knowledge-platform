@@ -34,6 +34,7 @@ column, API responses -- keeps working unchanged; `severity` is purely
 additive information for anyone who wants finer detail.
 """
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -92,6 +93,47 @@ _OPENING_MIN_GROUP_SIZE = 3
 _SIMILARITY_SHINGLE_WORDS = 6
 _SIMILARITY_JACCARD_THRESHOLD = 0.3
 _MIN_SHINGLES_FOR_SIMILARITY = 5
+
+# check_repeated_paragraph_openings: same near-match grouping technique as
+# check_repeated_section_openings above, but at PARAGRAPH granularity across
+# the WHOLE article (paragraph boundaries are the persisted "\n\n" join --
+# see app/ai/schemas.py::GeneratedSection and app/ai/nodes/section_generation.py).
+# A shorter 4-word window (vs. 8 for section openings) since a paragraph
+# opening's repetitive part is usually just its first word or two ("That...",
+# "This..."), and a group-size threshold SCALED to the article's own
+# paragraph count (never a fixed absolute count) -- a handful of articles
+# share an opening word once or twice by coincidence; what's actually
+# excessive is a meaningful fraction of all paragraphs doing it. Skipped
+# entirely (PASS) below a minimum paragraph count, where "a fraction of
+# all paragraphs" isn't a meaningful signal yet.
+_PARAGRAPH_OPENING_WINDOW_WORDS = 4
+_PARAGRAPH_OPENING_SIMILARITY_RATIO = 0.8
+_PARAGRAPH_OPENING_MIN_PARAGRAPHS = 8
+_PARAGRAPH_OPENING_MIN_GROUP_SIZE = 4
+_PARAGRAPH_OPENING_GROUP_RATIO = 0.25
+
+# check_attribution_phrase_density: the minimum set the requirement names
+# (says/explains/argues/notes/claims), each tense-expanded so a normal past-
+# tense article isn't undercounted. Matched with \b word-boundary regexes
+# (never a naive substring count) so e.g. "notes" doesn't also match inside
+# an unrelated word. Density (occurrences per 100 words), not a fixed
+# absolute count, so this scales across article lengths -- see the
+# check's own docstring for why a per-100-word rate is the right unit.
+_ATTRIBUTION_PHRASES = (
+    "says",
+    "said",
+    "explains",
+    "explained",
+    "argues",
+    "argued",
+    "notes",
+    "noted",
+    "claims",
+    "claimed",
+)
+_ATTRIBUTION_DENSITY_PER_100_WORDS_THRESHOLD = 1.5
+_ATTRIBUTION_MIN_ARTICLE_WORDS = 200
+_ATTRIBUTION_MAX_EXAMPLES = 3
 
 PASS = "pass"
 WARNING = "warning"
@@ -673,6 +715,152 @@ def check_similar_sections(sections: list[ArticleSection]) -> CheckResult:
     )
 
 
+# --- 16. Repeated paragraph-opening patterns (article-wide, paragraph granularity) ------
+
+
+def check_repeated_paragraph_openings(sections: list[ArticleSection]) -> CheckResult:
+    """WARNING only -- the paragraph-level counterpart to
+    check_repeated_section_openings above: several paragraphs across the
+    article (not just within one section) opening with the same word or
+    construction ("That...", "That...", "That...", "That...") is a common,
+    genuinely distracting editorial pattern that section-level checks can't
+    see at all. Uses actual paragraph boundaries (the persisted "\\n\\n"
+    join -- see app/ai/schemas.py::GeneratedSection's docstring), not
+    sentence splitting or any other heuristic. Deliberately conservative:
+    grouped by near-match (SequenceMatcher, same technique and ratio as the
+    section-opening check) rather than exact match, so two differently-worded
+    openings never count as the same group, and flagged only once the
+    offending group is a large enough FRACTION of all paragraphs in the
+    article (never a fixed absolute count) -- a couple of paragraphs
+    naturally starting the same common way is normal, not a defect.
+    """
+    paragraphs: list[tuple[int, str]] = []
+    for s in sections:
+        for paragraph in s.content.split("\n\n"):
+            if paragraph.strip():
+                paragraphs.append((s.sequence_number, paragraph.strip()))
+
+    if len(paragraphs) < _PARAGRAPH_OPENING_MIN_PARAGRAPHS:
+        return CheckResult(
+            "repeated_paragraph_openings", PASS, "Too few paragraphs to assess opening patterns."
+        )
+
+    openings: list[tuple[int, str]] = []
+    for seq, text in paragraphs:
+        words = " ".join(text.split()).lower().split(" ")[:_PARAGRAPH_OPENING_WINDOW_WORDS]
+        opening = " ".join(words)
+        if opening:
+            openings.append((seq, opening))
+
+    groups: list[list[tuple[int, str]]] = []
+    for seq, opening in openings:
+        placed = False
+        for group in groups:
+            representative = group[0][1]
+            if (
+                opening == representative
+                or SequenceMatcher(None, opening, representative).ratio() >= _PARAGRAPH_OPENING_SIMILARITY_RATIO
+            ):
+                group.append((seq, opening))
+                placed = True
+                break
+        if not placed:
+            groups.append([(seq, opening)])
+
+    threshold = max(
+        _PARAGRAPH_OPENING_MIN_GROUP_SIZE, round(len(paragraphs) * _PARAGRAPH_OPENING_GROUP_RATIO)
+    )
+    offending = [g for g in groups if len(g) >= threshold]
+    if not offending:
+        return CheckResult(
+            "repeated_paragraph_openings", PASS, "No excessively repeated paragraph-opening patterns."
+        )
+
+    largest = max(offending, key=len)
+    secs = tuple(sorted({seq for seq, _ in largest}))
+    example = largest[0][1]
+    details = (
+        f"{len(largest)} of {len(paragraphs)} paragraphs open with a near-identical pattern "
+        f"(e.g. {example!r}), spanning sections {list(secs)}"
+    )
+    return CheckResult(
+        "repeated_paragraph_openings",
+        WARNING,
+        details,
+        sections=secs,
+        metrics={
+            "largest_group_size": len(largest),
+            "total_paragraphs": len(paragraphs),
+            "threshold": threshold,
+        },
+    )
+
+
+# --- 17. Excessive attribution-phrase density (article-wide) ----------------------------
+
+
+def check_attribution_phrase_density(sections: list[ArticleSection]) -> CheckResult:
+    """WARNING only -- flags an article that leans on the same handful of
+    attribution verbs (says/explains/argues/notes/claims, at minimum) so
+    often it reads mechanically, WITHOUT ever suggesting attribution be
+    removed (see app/ai/prompts.py::section_generation_prompt's ATTRIBUTION
+    guidance, which explicitly says to vary the construction, never drop
+    it -- this check exists to catch a failure to vary, not to discourage
+    attribution itself). Measured as a DENSITY (occurrences per 100 words),
+    not a fixed absolute count, so a long article naturally attributing more
+    often in raw-count terms doesn't trip this while a short one repeating
+    the same verb constantly does. Matched with word-boundary regexes so a
+    phrase is never counted as a substring of an unrelated word. Skipped
+    entirely below a minimum article length, where a density estimate isn't
+    meaningful yet."""
+    full_text = " ".join(s.content for s in sections)
+    total_words = len(full_text.split())
+    if total_words < _ATTRIBUTION_MIN_ARTICLE_WORDS:
+        return CheckResult(
+            "attribution_phrase_density", PASS, "Article too short to assess attribution density."
+        )
+
+    normalized = full_text.lower()
+    counts: dict[str, int] = {}
+    for phrase in _ATTRIBUTION_PHRASES:
+        matches = re.findall(rf"\b{re.escape(phrase)}\b", normalized)
+        if matches:
+            counts[phrase] = len(matches)
+
+    total_occurrences = sum(counts.values())
+    density = (total_occurrences / total_words) * 100
+    if density <= _ATTRIBUTION_DENSITY_PER_100_WORDS_THRESHOLD:
+        return CheckResult(
+            "attribution_phrase_density",
+            PASS,
+            f"Attribution phrases appear {total_occurrences} times in {total_words} words "
+            f"({density:.2f} per 100 words).",
+            metrics={
+                "total_attribution_occurrences": total_occurrences,
+                "total_words": total_words,
+                "density_per_100_words": round(density, 2),
+            },
+        )
+
+    top_examples = sorted(counts.items(), key=lambda kv: -kv[1])[:_ATTRIBUTION_MAX_EXAMPLES]
+    examples_text = ", ".join(f"{phrase!r} x{count}" for phrase, count in top_examples)
+    details = (
+        f"Attribution phrases appear {total_occurrences} times in {total_words} words "
+        f"({density:.2f} per 100 words, above the {_ATTRIBUTION_DENSITY_PER_100_WORDS_THRESHOLD} "
+        f"per-100-word guide) -- most frequent: {examples_text}."
+    )
+    return CheckResult(
+        "attribution_phrase_density",
+        WARNING,
+        details,
+        metrics={
+            "total_attribution_occurrences": total_occurrences,
+            "total_words": total_words,
+            "density_per_100_words": round(density, 2),
+        },
+    )
+
+
 def run_validation(
     *,
     sections: list[ArticleSection],
@@ -707,5 +895,7 @@ def run_validation(
         check_excessive_phrase_repetition(sections),
         check_repeated_section_openings(sections),
         check_similar_sections(sections),
+        check_repeated_paragraph_openings(sections),
+        check_attribution_phrase_density(sections),
     ]
     return ValidationReport(checks=checks)

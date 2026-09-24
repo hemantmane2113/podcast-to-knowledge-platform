@@ -20,6 +20,10 @@ type PublicArticle = {
   episode_id: string;
   title: string;
   published_at: string;
+  episode_title: string | null;
+  channel_name: string | null;
+  youtube_url: string;
+  thumbnail_url: string | null;
   sections: PublicArticleSection[];
 };
 
@@ -59,13 +63,37 @@ export default async function BlogArticlePage({
       <h1 className="mt-4 text-3xl font-semibold tracking-tight">{article.title}</h1>
       <p className="mt-2 text-sm text-neutral-500">{formatDate(article.published_at)}</p>
 
+      {(article.episode_title || article.channel_name || article.youtube_url) && (
+        <div className="mt-6 rounded-lg border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-600">
+          <p>
+            Based on the conversation
+            {article.episode_title ? <>: <span className="font-medium">{article.episode_title}</span></> : null}
+          </p>
+          {article.channel_name && <p className="mt-1">{article.channel_name}</p>}
+          {article.youtube_url && (
+            <p className="mt-1">
+              <a
+                href={article.youtube_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-neutral-700 underline hover:text-neutral-900"
+              >
+                Watch the original conversation on YouTube
+              </a>
+            </p>
+          )}
+        </div>
+      )}
+
       <article className="mt-10 space-y-10">
         {article.sections.map((section) => (
           <section key={section.sequence_number}>
             <h2 className="text-xl font-semibold">{section.heading}</h2>
-            <p className="mt-3 whitespace-pre-wrap text-base leading-relaxed text-neutral-800">
-              {section.content}
-            </p>
+            <div className="mt-3 space-y-4 text-base leading-relaxed text-neutral-800">
+              {section.content.split("\n\n").map((paragraph, i) => (
+                <p key={i}>{paragraph}</p>
+              ))}
+            </div>
           </section>
         ))}
       </article>
