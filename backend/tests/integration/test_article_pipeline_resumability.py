@@ -73,6 +73,7 @@ def _initial_state(episode: Episode, transcript: Transcript, chunks: list[Chunk]
         "transcript_word_count": 100_000,  # keeps article_length trivially satisfied throughout
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
 
@@ -116,6 +117,10 @@ async def _seed_topics(session: AsyncSession, episode: Episode, transcript: Tran
 
 
 async def _seed_plan(session: AsyncSession, episode: Episode, topic_id: uuid.UUID, chunks: list[Chunk]):
+    # is_draft=True: these tests seed "already persisted from a prior
+    # attempt" state, which -- since app/worker/tasks.py::generate_article
+    # always runs with is_draft=True (Live/Draft Article Workflow) -- means
+    # a prior attempt's own persisted plan/article is always a draft.
     plan = await ArticlePlanRepository(session).replace(
         episode_id=episode.id,
         title="The Article",
@@ -131,6 +136,7 @@ async def _seed_plan(session: AsyncSession, episode: Episode, topic_id: uuid.UUI
             )
             for i, heading in enumerate(["Intro", "Body", "Conclusion"])
         ],
+        is_draft=True,
     )
     await session.commit()
     return plan
@@ -249,6 +255,7 @@ async def test_resumes_when_some_sections_already_persisted(db_session: AsyncSes
                 supporting_topic_ids=[topics[0].id],
             ),
         ],
+        is_draft=True,
     )
     await db_session.commit()
 
@@ -285,7 +292,7 @@ async def test_crash_after_several_sections_resumes_from_the_missing_ones(db_ses
 
     # Sections generated before the crash must have survived it --
     # committed individually, not lost with the in-flight 3rd section.
-    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article is not None
     assert {s.heading for s in article.sections} == {"Intro", "Body"}
 
@@ -325,7 +332,7 @@ async def test_failed_section_is_not_persisted_and_retry_regenerates_it(db_sessi
 
     # get_or_create persists the Article row eagerly, but the section
     # itself -- whose generation call raised -- must never be written.
-    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article is not None
     assert article.sections == []
 
@@ -364,6 +371,7 @@ async def test_all_sections_already_exist_generates_nothing_and_validates_correc
                 [("Intro", "intro"), ("Body", "body"), ("Conclusion", "conclusion")]
             )
         ],
+        is_draft=True,
     )
     await db_session.commit()
 

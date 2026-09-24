@@ -15,6 +15,17 @@ class EpisodeRepository:
     async def get_by_id(self, episode_id: uuid.UUID) -> Episode | None:
         return await self._session.get(Episode, episode_id)
 
+    async def get_by_id_for_update(self, episode_id: uuid.UUID) -> Episode | None:
+        """SELECT ... FOR UPDATE -- locks the episode row for the rest of
+        the caller's transaction, serializing concurrent multi-step
+        read-then-write sequences against it (e.g. two promote_draft
+        calls racing for the same episode) rather than letting them
+        interleave. Only ArticleService.promote_draft needs this today."""
+        result = await self._session.execute(
+            select(Episode).where(Episode.id == episode_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_youtube_video_id(self, youtube_video_id: str) -> Episode | None:
         result = await self._session.execute(
             select(Episode).where(Episode.youtube_video_id == youtube_video_id)

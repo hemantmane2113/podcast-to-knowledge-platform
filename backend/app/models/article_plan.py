@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,16 +17,28 @@ class ArticlePlan(UUIDPrimaryKeyMixin, Base):
     persisted on its own so it can be inspected independently of the
     generated prose, per the Phase E requirement.
 
-    One episode has at most one ArticlePlan (like Transcript); a
-    regeneration replaces it via ArticlePlanRepository.replace, same
-    idempotency shape as Chunk/Topic.
+    An episode has at most one LIVE (is_draft=False) ArticlePlan and at
+    most one DRAFT (is_draft=True) one at a time -- enforced by the
+    partial unique index below, not a plain UNIQUE(episode_id) (Live/Draft
+    Article Workflow). A regeneration creates/replaces the DRAFT via
+    ArticlePlanRepository.replace(..., is_draft=True); the live plan is
+    never touched by regeneration, only by ArticleService.promote_draft.
     """
 
     __tablename__ = "article_plans"
+    __table_args__ = (
+        Index(
+            "uq_article_plans_episode_id_live",
+            "episode_id",
+            unique=True,
+            postgresql_where=text("NOT is_draft"),
+        ),
+    )
 
     episode_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE"), unique=True
+        UUID(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE")
     )
+    is_draft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
     title: Mapped[str] = mapped_column(Text)
     introduction_summary: Mapped[str] = mapped_column(Text)
@@ -43,4 +55,4 @@ class ArticlePlan(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    episode: Mapped["Episode"] = relationship(back_populates="article_plan")
+    episode: Mapped["Episode"] = relationship(back_populates="article_plans")

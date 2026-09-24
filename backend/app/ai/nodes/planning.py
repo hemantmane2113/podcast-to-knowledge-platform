@@ -8,7 +8,6 @@ from app.ai.prompts import EpisodeContext, planning_prompt
 from app.ai.schemas import ArticlePlanResult
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.article_plan import ArticlePlan
-from app.models.episode import ProcessingStatus
 from app.providers.llm.base import LLMMessage
 from app.repositories.article_plan_repository import PlannedSectionData
 
@@ -28,10 +27,12 @@ def _plan_is_complete(plan: ArticlePlan | None) -> bool:
 
 def build(deps: PipelineDeps):
     async def planning_node(state: ArticlePipelineState) -> dict:
+        # episode is fetched for EpisodeContext (below), not for status
+        # tracking -- article-generation progress lives on ProcessingJob.status
+        # now, never on Episode.status (Episode.status Decoupling /
+        # Live-Draft Article Workflow), so a draft regeneration can never
+        # overwrite a currently-PUBLISHED episode's publication state.
         episode = await deps.episodes.get_by_id(state["episode_id"])
-        if episode is not None:
-            deps.episodes.set_status(episode, ProcessingStatus.PLANNING)
-            await deps.session.commit()
 
         # Resumability (Batch 2B): reuse an already-persisted plan from a
         # prior attempt at this episode's generation rather than calling
@@ -41,7 +42,7 @@ def build(deps: PipelineDeps):
         # skipping the call when a valid plan already exists is what keeps
         # section_generation_node's own incrementally-persisted sections
         # (see app/ai/nodes/section_generation.py) alive across a retry.
-        existing_plan = await deps.article_plans.get_by_episode_id(state["episode_id"])
+        existing_plan = await deps.article_plans.get_by_episode_id(state["episode_id"], is_draft=state["is_draft"])
         if _plan_is_complete(existing_plan):
             logger.info("Planning: reusing already-persisted article plan %s", existing_plan.id)
             return {"plan": existing_plan}
@@ -102,6 +103,7 @@ def build(deps: PipelineDeps):
             introduction_summary=result.introduction_summary,
             conclusion_summary=result.conclusion_summary,
             sections=planned_sections,
+            is_draft=state["is_draft"],
         )
         await deps.session.commit()
 

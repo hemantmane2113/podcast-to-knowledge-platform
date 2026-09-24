@@ -34,7 +34,6 @@ from app.ai.nodes.section_generation import (
 )
 from app.ai.prompts import EpisodeContext
 from app.ai.state import ArticlePipelineState, PipelineDeps
-from app.models.episode import ProcessingStatus
 from app.repositories.article_repository import ArticleSectionCandidate
 
 _SECTION_REF_RE = re.compile(r"section (\d+)")
@@ -59,10 +58,12 @@ def _sections_needing_revision(checks: list[dict]) -> tuple[set[int], list[str]]
 
 def build(deps: PipelineDeps):
     async def revision_node(state: ArticlePipelineState) -> dict:
+        # episode is fetched for EpisodeContext (below), not for status
+        # tracking -- article-generation progress lives on ProcessingJob.status
+        # now, never on Episode.status (Episode.status Decoupling /
+        # Live-Draft Article Workflow), so a draft regeneration can never
+        # overwrite a currently-PUBLISHED episode's publication state.
         episode = await deps.episodes.get_by_id(state["episode_id"])
-        if episode is not None:
-            deps.episodes.set_status(episode, ProcessingStatus.REVISING)
-            await deps.session.commit()
 
         report = state["validation_report"]
         checks = report.to_json()
@@ -164,6 +165,7 @@ def build(deps: PipelineDeps):
             title=plan.title,
             revision_count=revision_count,
             sections=candidates,
+            is_draft=state["is_draft"],
         )
         await deps.session.commit()
 

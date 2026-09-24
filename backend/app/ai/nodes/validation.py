@@ -26,7 +26,6 @@ from app.ai.prompts import article_editorial_review_prompt
 from app.ai.schemas import ArticleEditorialReview
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.core.exceptions import LLMProviderError
-from app.models.episode import ProcessingStatus
 from app.providers.llm.base import LLMMessage
 from app.services.article_validation import run_validation
 
@@ -64,11 +63,9 @@ async def _editorial_review(deps: PipelineDeps, article) -> ArticleEditorialRevi
 
 def build(deps: PipelineDeps):
     async def validation_node(state: ArticlePipelineState) -> dict:
-        episode = await deps.episodes.get_by_id(state["episode_id"])
-        if episode is not None:
-            deps.episodes.set_status(episode, ProcessingStatus.VERIFYING)
-            await deps.session.commit()
-
+        # Article-generation progress lives on ProcessingJob.status now,
+        # never on Episode.status (Episode.status Decoupling / Live-Draft
+        # Article Workflow) -- no episode fetch/status write needed here.
         article = state["article"]
         report = run_validation(
             sections=article.sections,

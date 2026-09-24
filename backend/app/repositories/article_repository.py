@@ -29,10 +29,15 @@ class ArticleRepository:
     def __init__(self, session: AsyncSession):
         self._session = session
 
-    async def get_by_episode_id(self, episode_id: uuid.UUID) -> Article | None:
+    async def get_by_episode_id(self, episode_id: uuid.UUID, *, is_draft: bool = False) -> Article | None:
+        """`is_draft` defaults to False (the live article) -- every
+        existing call site that doesn't explicitly ask for the draft
+        keeps resolving only the live row, unchanged (Live/Draft Article
+        Workflow). The partial unique index guarantees at most one row
+        can ever match a given (episode_id, is_draft) pair."""
         result = await self._session.execute(
             select(Article)
-            .where(Article.episode_id == episode_id)
+            .where(Article.episode_id == episode_id, Article.is_draft == is_draft)
             .options(selectinload(Article.sections), selectinload(Article.validation_results))
         )
         return result.scalar_one_or_none()
@@ -49,7 +54,7 @@ class ArticleRepository:
                 Episode.article_published_at.label("article_published_at"),
             )
             .join(Episode, Article.episode_id == Episode.id)
-            .where(Episode.status == ProcessingStatus.PUBLISHED)
+            .where(Episode.status == ProcessingStatus.PUBLISHED, Article.is_draft.is_(False))
             .order_by(Episode.article_published_at.desc())
         )
         return list(result.all())
@@ -62,20 +67,28 @@ class ArticleRepository:
         title: str,
         revision_count: int,
         sections: list[ArticleSectionCandidate],
+        is_draft: bool = False,
     ) -> Article:
         """Delete-then-insert, same idempotency shape as Chunk/Topic --
-        deleting the existing Article cascades to its sections and
-        validation_results (both FK ondelete='CASCADE'). `revision_count`
-        is supplied by the caller (app/ai/graph.py's state), not computed
-        here, since the repository has no notion of "this is a revision
-        vs. the first generation".
+        deleting the existing Article for this (episode_id, is_draft) pair
+        cascades to its sections and validation_results (both FK
+        ondelete='CASCADE'). `revision_count` is supplied by the caller
+        (app/ai/graph.py's state), not computed here, since the repository
+        has no notion of "this is a revision vs. the first generation".
+        `is_draft` scopes both the delete and the new row (Live/Draft
+        Article Workflow) -- app/ai/nodes/revision.py always calls this
+        with is_draft=True, so a revision's delete-then-insert can never
+        touch the live article.
         """
-        await self._session.execute(delete(Article).where(Article.episode_id == episode_id))
+        await self._session.execute(
+            delete(Article).where(Article.episode_id == episode_id, Article.is_draft == is_draft)
+        )
 
         article = Article(
             id=uuid.uuid4(),
             episode_id=episode_id,
             article_plan_id=article_plan_id,
+            is_draft=is_draft,
             title=title,
             revision_count=revision_count,
         )
@@ -94,7 +107,13 @@ class ArticleRepository:
         return article
 
     async def get_or_create(
-        self, *, episode_id: uuid.UUID, article_plan_id: uuid.UUID, title: str, revision_count: int = 0
+        self,
+        *,
+        episode_id: uuid.UUID,
+        article_plan_id: uuid.UUID,
+        title: str,
+        revision_count: int = 0,
+        is_draft: bool = False,
     ) -> Article:
         """Resumability's entry point for the Article row itself (see
         app/ai/nodes/section_generation.py): returns the existing Article
@@ -102,22 +121,30 @@ class ArticleRepository:
         `article_plan_id` (the plan THIS run is using, whether freshly
         planned or reused), so a resumed job never loses already-persisted
         sections. Only creates a fresh, empty Article when there isn't one
-        yet, or when the existing one belongs to a different plan -- which
-        should never happen given ArticlePlanRepository.replace's cascade
-        delete on regeneration, but is never trusted blindly (see the
-        Batch 2B identity requirement: never silently reuse an article
-        that doesn't actually belong to the current plan).
+        yet for this (episode_id, is_draft) pair, or when the existing one
+        belongs to a different plan -- which should never happen given
+        ArticlePlanRepository.replace's cascade delete on regeneration,
+        but is never trusted blindly (see the Batch 2B identity
+        requirement: never silently reuse an article that doesn't
+        actually belong to the current plan). `is_draft` scopes the
+        lookup/delete/create (Live/Draft Article Workflow) --
+        app/ai/nodes/section_generation.py always calls this with
+        is_draft=True, so it can never accidentally retrieve or overwrite
+        the live article.
         """
-        existing = await self.get_by_episode_id(episode_id)
+        existing = await self.get_by_episode_id(episode_id, is_draft=is_draft)
         if existing is not None and existing.article_plan_id == article_plan_id:
             return existing
         if existing is not None:
-            await self._session.execute(delete(Article).where(Article.episode_id == episode_id))
+            await self._session.execute(
+                delete(Article).where(Article.episode_id == episode_id, Article.is_draft == is_draft)
+            )
 
         article = Article(
             id=uuid.uuid4(),
             episode_id=episode_id,
             article_plan_id=article_plan_id,
+            is_draft=is_draft,
             title=title,
             revision_count=revision_count,
         )

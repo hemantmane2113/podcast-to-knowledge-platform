@@ -12,6 +12,14 @@ type Episode = {
   last_error: string | null;
 };
 
+// Episode.status Decoupling: article-generation progress lives on
+// ProcessingJob.status now, never on Episode.status -- this mirrors
+// app/schemas/article.py::ArticleGenerationStatusResponse.
+type GenerationStatus = {
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | null;
+  error_message: string | null;
+};
+
 type SourceChunk = {
   id: string;
   start_ms: number;
@@ -55,33 +63,51 @@ function formatTimestamp(ms: number): string {
 }
 
 // This is a minimal human-review surface (Phase I) -- not the real
-// editorial CMS (that's a later phase). It shows the generated article,
-// its sections' supporting source chunks with timestamps, processing
-// status, and validation results so a reviewer can judge the output
-// before anything gets published.
+// editorial CMS (that's a later phase). Live/Draft Article Workflow: this
+// page always shows the episode's DRAFT article (GET .../article?draft=true)
+// -- the in-progress/awaiting-review generation -- never the live one, so a
+// reviewer can judge a freshly generated draft (including a regeneration of
+// an already-published episode) without it ever being visible publicly.
+// "Promote to Live" is the explicit, deliberate step that makes it public.
 export default function ReviewPage() {
   const params = useParams<{ episodeId: string }>();
   const episodeId = params.episodeId;
 
   const [episode, setEpisode] = useState<Episode | null>(null);
+  const [generationStatus, setGenerationStatus] = useState<GenerationStatus | null>(null);
   const [article, setArticle] = useState<Article | null>(null);
   const [articleError, setArticleError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [promoting, setPromoting] = useState(false);
+  const [promoteError, setPromoteError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenerateError, setRegenerateError] = useState<string | null>(null);
+
+  // Episode.status Decoupling: generation progress lives on
+  // ProcessingJob.status now (via generation-status), never on
+  // Episode.status. Computed once, before any early return, so both the
+  // poll effect and the Regenerate button's disabled state agree.
+  const inFlight = generationStatus?.status === "PENDING" || generationStatus?.status === "RUNNING";
 
   async function refresh() {
     const episodeResponse = await fetch(`${API_BASE_URL}/api/v1/episodes/${episodeId}`);
     if (episodeResponse.ok) setEpisode(await episodeResponse.json());
 
-    const articleResponse = await fetch(`${API_BASE_URL}/api/v1/episodes/${episodeId}/article`);
+    const statusResponse = await fetch(`${API_BASE_URL}/api/v1/episodes/${episodeId}/generation-status`);
+    if (statusResponse.ok) setGenerationStatus(await statusResponse.json());
+
+    const articleResponse = await fetch(
+      `${API_BASE_URL}/api/v1/episodes/${episodeId}/article?draft=true`
+    );
     if (articleResponse.ok) {
       setArticle(await articleResponse.json());
       setArticleError(null);
     } else if (articleResponse.status === 404) {
       setArticle(null);
-      setArticleError(null); // no article yet -- not an error state
+      setArticleError(null); // no draft yet -- not an error state
     } else {
       const body = await articleResponse.json().catch(() => null);
-      setArticleError(body?.message ?? "Failed to load article");
+      setArticleError(body?.message ?? "Failed to load draft article");
     }
   }
 
@@ -92,15 +118,15 @@ export default function ReviewPage() {
   }, [episodeId]);
 
   useEffect(() => {
-    if (!episode) return;
-    const inFlight = ["ANALYZING", "PLANNING", "GENERATING", "VERIFYING", "REVISING"].includes(
-      episode.status
-    );
+    // Poll while the latest ARTICLE_GENERATION job is still
+    // PENDING/RUNNING -- this also covers the job a Regenerate click just
+    // enqueued, since that flips generationStatus back to PENDING on the
+    // next refresh() below and re-triggers this effect.
     if (!inFlight) return;
     const interval = setInterval(refresh, 3000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [episode?.status]);
+  }, [inFlight]);
 
   async function handleGenerate() {
     setGenerating(true);
@@ -114,6 +140,49 @@ export default function ReviewPage() {
     }
   }
 
+  async function handleRegenerate() {
+    // Uses the existing explicit regeneration endpoint
+    // (POST /episodes/{id}/regenerate-article -- ArticleService
+    // .request_regeneration) exactly as it already works: it only ever
+    // touches the episode's DRAFT plan/article (replacing a stale/failed/
+    // partial one, if any) and enqueues a fresh ARTICLE_GENERATION job.
+    // The live article is never read, deleted, or otherwise touched here
+    // or by that endpoint.
+    setRegenerating(true);
+    setRegenerateError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/episodes/${episodeId}/regenerate-article`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        await refresh(); // picks up the new draft state and the freshly PENDING job, resuming polling
+      } else {
+        const body = await response.json().catch(() => null);
+        setRegenerateError(body?.message ?? "Failed to start regeneration");
+      }
+    } finally {
+      setRegenerating(false);
+    }
+  }
+
+  async function handlePromote() {
+    setPromoting(true);
+    setPromoteError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/episodes/${episodeId}/promote-draft`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        await refresh();
+      } else {
+        const body = await response.json().catch(() => null);
+        setPromoteError(body?.message ?? "Failed to promote draft");
+      }
+    } finally {
+      setPromoting(false);
+    }
+  }
+
   if (!episode) {
     return (
       <main className="mx-auto max-w-3xl px-6 py-16">
@@ -121,6 +190,8 @@ export default function ReviewPage() {
       </main>
     );
   }
+
+  const canPromote = generationStatus?.status === "COMPLETED" && article?.latest_validation?.passed;
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-16">
@@ -132,10 +203,20 @@ export default function ReviewPage() {
           <dt className="text-neutral-500">Episode status</dt>
           <dd className="font-mono">{episode.status}</dd>
         </div>
+        <div className="flex gap-2">
+          <dt className="text-neutral-500">Draft generation</dt>
+          <dd className="font-mono">{generationStatus?.status ?? "—"}</dd>
+        </div>
         {episode.last_error && (
           <div className="flex gap-2">
             <dt className="text-neutral-500">Error</dt>
             <dd className="text-red-600">{episode.last_error}</dd>
+          </div>
+        )}
+        {generationStatus?.error_message && (
+          <div className="flex gap-2">
+            <dt className="text-neutral-500">Generation error</dt>
+            <dd className="text-red-600">{generationStatus.error_message}</dd>
           </div>
         )}
       </dl>
@@ -149,6 +230,27 @@ export default function ReviewPage() {
           {generating ? "Starting…" : "Generate Article"}
         </button>
       )}
+
+      {article && (
+        <div className="mt-6 flex gap-2">
+          <button
+            onClick={handlePromote}
+            disabled={!canPromote || promoting}
+            className="rounded bg-neutral-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+          >
+            {promoting ? "Promoting…" : "Promote to Live"}
+          </button>
+          <button
+            onClick={handleRegenerate}
+            disabled={inFlight || regenerating}
+            className="rounded border border-neutral-900 px-4 py-2 text-sm text-neutral-900 disabled:opacity-50"
+          >
+            {regenerating ? "Starting…" : "Regenerate"}
+          </button>
+        </div>
+      )}
+      {promoteError && <p className="mt-2 text-sm text-red-600">{promoteError}</p>}
+      {regenerateError && <p className="mt-2 text-sm text-red-600">{regenerateError}</p>}
 
       {articleError && <p className="mt-4 text-sm text-red-600">{articleError}</p>}
 

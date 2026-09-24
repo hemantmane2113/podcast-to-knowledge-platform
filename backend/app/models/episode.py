@@ -81,9 +81,17 @@ class Episode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     processing_jobs: Mapped[list["ProcessingJob"]] = relationship(
         back_populates="episode", cascade="all, delete-orphan"
     )
-    article_plan: Mapped["ArticlePlan | None"] = relationship(
-        back_populates="episode", uselist=False, cascade="all, delete-orphan"
+    # list, not uselist=False -- an episode can have up to two ArticlePlan/
+    # Article rows at once (one live, one draft; Live/Draft Article
+    # Workflow). Neither relationship attribute is read anywhere in
+    # application code today (all access goes through
+    # ArticlePlanRepository/ArticleRepository's explicit, is_draft-scoped
+    # queries) -- kept accurate here defensively, so a future accidental
+    # use never silently mixes live and draft rows or raises
+    # MultipleResultsFound.
+    article_plans: Mapped[list["ArticlePlan"]] = relationship(
+        back_populates="episode", cascade="all, delete-orphan"
     )
-    article: Mapped["Article | None"] = relationship(
-        back_populates="episode", uselist=False, cascade="all, delete-orphan"
+    articles: Mapped[list["Article"]] = relationship(
+        back_populates="episode", cascade="all, delete-orphan"
     )

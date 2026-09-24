@@ -509,10 +509,14 @@ async def test_generate_article_success_persists_article_and_marks_ready_for_rev
     await generate_article(ctx, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    # Episode.status Decoupling: article-generation progress lives on
+    # ProcessingJob.status now -- Episode.status must stay exactly as
+    # _seed_episode_with_chunks left it (TRANSCRIPT_FETCHED), never
+    # advance to READY_FOR_REVIEW.
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.COMPLETED
 
-    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article is not None
     assert article.title == "The Article"
     assert len(article.sections) == 3
@@ -527,8 +531,12 @@ async def test_generate_article_missing_llm_provider_fails_without_raising(
     await generate_article(ctx, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
-    assert "not configured" in refreshed_episode.last_error
+    # Episode.status Decoupling: this failure happens before any pipeline
+    # state exists, but it's still a generate_article failure path, so it
+    # must never overwrite Episode.status either -- the error is recorded
+    # on ProcessingJob only.
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
+    assert "not configured" in refreshed_job.error_message
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -544,7 +552,10 @@ async def test_generate_article_missing_transcript_fails_without_raising(
     await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: episode was seeded via a bare
+    # episodes.create() (INGESTING), and article generation never writes
+    # Episode.status, so it must remain INGESTING here.
+    assert refreshed_episode.status == ProcessingStatus.INGESTING
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -557,7 +568,10 @@ async def test_generate_article_missing_chunks_fails_without_raising(db_session:
     await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: seeded via _seed_episode_with_transcript
+    # (TRANSCRIPT_FETCHED), and article generation never writes
+    # Episode.status.
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -582,7 +596,7 @@ async def test_generate_article_lazily_constructs_the_provider_when_ctx_has_no_o
 
     assert len(calls) == 1
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.COMPLETED
 
 
@@ -605,8 +619,11 @@ async def test_generate_article_fails_clearly_when_lazy_construction_raises(
     await generate_article({"job_try": 1}, str(episode.id), str(job.id))  # no "llm_provider" key
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
-    assert "not configured" in refreshed_episode.last_error
+    # Episode.status Decoupling: this failure happens before any pipeline
+    # state exists, but it's still a generate_article failure path, so it
+    # must never overwrite Episode.status either.
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
+    assert "not configured" in refreshed_job.error_message
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -635,7 +652,11 @@ async def test_generate_article_marks_failed_on_cancellation_instead_of_leaving_
         await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: seeded via _seed_episode_with_chunks
+    # (TRANSCRIPT_FETCHED), and a cancelled draft generation must never
+    # overwrite Episode.status (update_episode_status=False in
+    # generate_article's CancelledError handler).
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -656,13 +677,15 @@ async def test_generate_article_retryable_failure_raises_arq_retry_on_attempt_1(
     assert exc_info.value.defer_score == RETRY_DEFER_SECONDS * 1000
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    # topic_analysis_node sets ANALYZING (and commits) before making its
-    # LLM call, so that status is legitimately visible here -- this is not
-    # a bug, just where the failure occurred within the pipeline.
-    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    # Episode.status Decoupling: topic_analysis_node no longer writes
+    # Episode.status at all -- article-generation progress lives entirely
+    # on ProcessingJob.status now, so this stays exactly as seeded
+    # (TRANSCRIPT_FETCHED) regardless of where in the pipeline the retry
+    # occurred.
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.RUNNING
     assert refreshed_job.error_message is None
-    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article is None
 
 
@@ -677,7 +700,7 @@ async def test_generate_article_retryable_failure_raises_arq_retry_on_attempt_2(
         await generate_article(ctx, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.ANALYZING
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.RUNNING
 
 
@@ -692,7 +715,7 @@ async def test_generate_article_retryable_failure_marks_failed_on_final_attempt(
     await generate_article(ctx, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.FAILED
     assert refreshed_job.error_message == "still failing"
 
@@ -715,9 +738,9 @@ async def test_generate_article_succeeds_on_a_genuine_retry_after_attempt_1_fail
     await generate_article({"job_try": 2, "llm_provider": succeeding_llm}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.COMPLETED
-    article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article is not None
     assert len(article.sections) == 3
 
@@ -758,7 +781,7 @@ async def test_generate_article_retry_resumes_from_already_persisted_sections(
 
     # Confirms the premise: attempt 1 really did persist topic analysis,
     # planning, and exactly one section before failing.
-    article_after_attempt_1 = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    article_after_attempt_1 = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
     assert article_after_attempt_1 is not None
     assert len(article_after_attempt_1.sections) == 1
     assert article_after_attempt_1.sections[0].heading == "Intro"
@@ -772,7 +795,7 @@ async def test_generate_article_retry_resumes_from_already_persisted_sections(
     await generate_article({"job_try": 2, "llm_provider": attempt_2_llm}, str(episode.id), str(job.id))
 
     refreshed_episode, refreshed_job = await _reload(episode.id, job.id)
-    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_job.status == JobStatus.COMPLETED
 
     # A fresh session/engine, not db_session -- db_session's identity map
@@ -785,7 +808,7 @@ async def test_generate_article_retry_resumes_from_already_persisted_sections(
     engine = create_async_engine(TEST_DATABASE_URL)
     try:
         async with AsyncSession(bind=engine) as fresh_session:
-            final_article = await ArticleRepository(fresh_session).get_by_episode_id(episode.id)
+            final_article = await ArticleRepository(fresh_session).get_by_episode_id(episode.id, is_draft=True)
     finally:
         await engine.dispose()
 
@@ -819,7 +842,7 @@ async def test_generate_article_two_historical_jobs_for_the_same_episode_do_not_
 
     refreshed_episode, refreshed_first_job = await _reload(episode.id, job.id)
     _, refreshed_second_job = await _reload(episode.id, second_job.id)
-    assert refreshed_episode.status == ProcessingStatus.READY_FOR_REVIEW
+    assert refreshed_episode.status == ProcessingStatus.TRANSCRIPT_FETCHED
     assert refreshed_first_job.status == JobStatus.COMPLETED
     assert refreshed_second_job.status == JobStatus.COMPLETED
 
@@ -827,7 +850,7 @@ async def test_generate_article_two_historical_jobs_for_the_same_episode_do_not_
 async def test_generate_article_is_idempotent_on_rerun(db_session: AsyncSession) -> None:
     episode, transcript, job = await _seed_episode_with_chunks(db_session)
     await generate_article({"job_try": 1, "llm_provider": _fake_llm_provider()}, str(episode.id), str(job.id))
-    first_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    first_article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
 
     second_job = ProcessingJobRepository(db_session).create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
     await db_session.commit()
@@ -835,7 +858,7 @@ async def test_generate_article_is_idempotent_on_rerun(db_session: AsyncSession)
     await generate_article(
         {"job_try": 1, "llm_provider": second_llm}, str(episode.id), str(second_job.id)
     )
-    second_article = await ArticleRepository(db_session).get_by_episode_id(episode.id)
+    second_article = await ArticleRepository(db_session).get_by_episode_id(episode.id, is_draft=True)
 
     # Batch 2B (resumability): the first run already produced a complete,
     # valid article, so the second run reuses it entirely -- same row, zero

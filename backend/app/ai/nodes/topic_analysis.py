@@ -23,7 +23,6 @@ from app.ai.prompts import topic_analysis_prompt, topic_boundary_merge_prompt
 from app.ai.schemas import TopicAnalysisResult, TopicClaim, TopicItem, TopicMergeDecision, TopicMergeGroup
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.models.chunk import Chunk
-from app.models.episode import ProcessingStatus
 from app.models.topic import Topic
 from app.providers.llm.base import LLMMessage
 from app.repositories.topic_repository import TopicCandidate
@@ -209,10 +208,14 @@ async def _merge_topics(
 
 def build(deps: PipelineDeps):
     async def topic_analysis_node(state: ArticlePipelineState) -> dict:
-        episode = await deps.episodes.get_by_id(state["episode_id"])
-        if episode is not None:
-            deps.episodes.set_status(episode, ProcessingStatus.ANALYZING)
-            await deps.session.commit()
+        # Article-generation progress (ANALYZING/PLANNING/GENERATING/
+        # VERIFYING/REVISING) is no longer tracked on Episode.status --
+        # ProcessingJob.status is now the sole source of generation
+        # progress, so a draft regeneration can never overwrite a
+        # currently-PUBLISHED episode's publication state (Episode.status
+        # Decoupling / Live-Draft Article Workflow). See
+        # app/worker/tasks.py::generate_article for the job-level
+        # RUNNING/COMPLETED/FAILED transitions this relies on instead.
 
         # Resumability (Batch 2B): a prior attempt for this episode/job may
         # already have completed topic analysis before a worker crash or

@@ -132,7 +132,13 @@ async def test_recover_marks_stale_running_article_generation_job_failed(
     db_session.expire_all()  # written through a separate session -- see below
     refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
     refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: stale-job recovery routes through
+    # _mark_failed(update_episode_status=False) -- a stale DRAFT
+    # generation job's recovery must never overwrite the episode's
+    # publication state, so Episode.status stays exactly as _seed_episode
+    # left it (ANALYZING is just this test's arbitrary seeded value here,
+    # not a status article generation writes anymore).
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
     assert refreshed_job.status == JobStatus.FAILED
     assert refreshed_job.error_message
 
@@ -253,7 +259,9 @@ async def test_recover_marks_job_just_outside_the_cutoff_failed(
     db_session.expire_all()  # written through a separate session -- see above
     refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
     refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: see the identical note in
+    # test_recover_marks_stale_running_article_generation_job_failed above.
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
     assert refreshed_job.status == JobStatus.FAILED
 
 
@@ -276,7 +284,9 @@ async def test_recover_marks_stale_pending_article_generation_job_failed(
     db_session.expire_all()  # written through a separate session -- see above
     refreshed_episode = await EpisodeRepository(db_session).get_by_id(episode_id)
     refreshed_job = await ProcessingJobRepository(db_session).get_by_id(job_id)
-    assert refreshed_episode.status == ProcessingStatus.FAILED
+    # Episode.status Decoupling: see the identical note in
+    # test_recover_marks_stale_running_article_generation_job_failed above.
+    assert refreshed_episode.status == ProcessingStatus.ANALYZING
     assert refreshed_job.status == JobStatus.FAILED
 
 

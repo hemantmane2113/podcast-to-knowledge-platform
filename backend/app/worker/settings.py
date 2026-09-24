@@ -93,8 +93,11 @@ async def _recover_stale_article_generation_jobs(ctx: dict) -> None:
     without ever having been picked up (e.g. a worker died between enqueue
     and its first mark_running) -- and marks them FAILED via the same
     `_mark_failed` helper every other failure path in app/worker/tasks.py
-    uses, so the episode is unstuck from ANALYZING and a user can retry
-    generation instead of the job being wedged forever.
+    uses, so the job is unstuck from RUNNING/PENDING and a user can retry
+    generation instead of the job being wedged forever. update_episode_status
+    =False: a stale DRAFT generation job's recovery must never overwrite a
+    currently-PUBLISHED episode's publication state (Episode.status
+    Decoupling / Live-Draft Article Workflow).
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=STALE_JOB_CUTOFF_SECONDS)
     session_factory = get_sessionmaker()
@@ -120,6 +123,7 @@ async def _recover_stale_article_generation_jobs(ctx: dict) -> None:
                 job.episode_id,
                 job.id,
                 "Article generation was interrupted by a worker restart. Please retry.",
+                update_episode_status=False,
             )
 
 

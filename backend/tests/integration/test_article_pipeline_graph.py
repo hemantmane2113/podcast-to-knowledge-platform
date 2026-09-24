@@ -102,6 +102,7 @@ async def test_pipeline_persists_topics_plan_article_and_passing_validation(
         "transcript_word_count": 100_000,  # keeps the length check trivially satisfied
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -113,8 +114,13 @@ async def test_pipeline_persists_topics_plan_article_and_passing_validation(
     assert final_state["validation_report"].passed
     assert final_state.get("revision_count", 0) == 0
 
+    # Episode.status Decoupling: article-generation progress is tracked on
+    # ProcessingJob.status now, never on Episode.status -- the pipeline
+    # running to completion must leave Episode.status exactly as it found
+    # it (CHUNKING, from _seed below), not advance it through
+    # ANALYZING/.../VERIFYING.
     refreshed_episode = await db_session.get(Episode, episode.id)
-    assert refreshed_episode.status == ProcessingStatus.VERIFYING
+    assert refreshed_episode.status == ProcessingStatus.CHUNKING
 
 
 async def test_pipeline_revises_a_failing_section_until_it_passes(db_session: AsyncSession) -> None:
@@ -143,6 +149,7 @@ async def test_pipeline_revises_a_failing_section_until_it_passes(db_session: As
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -182,6 +189,7 @@ async def test_pipeline_stops_after_max_revision_attempts_even_if_still_failing(
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -260,6 +268,7 @@ async def test_pipeline_passes_narrative_context_and_already_covered_material_to
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -355,6 +364,7 @@ async def test_topic_analysis_batches_when_chunks_exceed_token_budget(db_session
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -431,6 +441,7 @@ async def test_editorial_review_targets_only_flagged_sections_and_preserves_prov
         "transcript_word_count": 100_000,  # keeps article_length trivially satisfied
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -523,6 +534,7 @@ async def test_editorial_review_prevents_uniform_regeneration_on_a_section_less_
         "transcript_word_count": 500,
         "revision_count": 0,
         "max_revision_attempts": 1,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -567,6 +579,7 @@ async def test_editorial_review_flagging_nothing_does_not_trigger_an_unnecessary
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)
@@ -604,6 +617,7 @@ async def test_editorial_review_disabled_by_default_adds_no_llm_call_and_no_edit
         "transcript_word_count": 100_000,
         "revision_count": 0,
         "max_revision_attempts": 2,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)

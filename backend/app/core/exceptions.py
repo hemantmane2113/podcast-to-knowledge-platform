@@ -71,6 +71,18 @@ class ArticleNotFoundError(AppError):
     status_code = 404
 
 
+class DraftNotReadyError(AppError):
+    """The episode's current draft ArticleGeneration job hasn't reached a
+    promotable terminal state yet -- either still PENDING/RUNNING, or its
+    most recent attempt FAILED outright. Distinct from
+    ArticleValidationNotPassedError, which covers a job that DID complete
+    but whose ValidationResult is missing or didn't pass -- see
+    ArticleService.promote_draft."""
+
+    code = "DRAFT_NOT_READY"
+    status_code = 409
+
+
 class ArticleValidationNotPassedError(AppError):
     """The article's latest ValidationResult doesn't exist or didn't
     pass (app/services/article_validation.py) -- publishing requires a

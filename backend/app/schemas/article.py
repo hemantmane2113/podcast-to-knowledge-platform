@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.models.article import Article
 from app.models.chunk import Chunk
 from app.models.episode import Episode, ProcessingStatus
+from app.models.processing_job import JobStatus, ProcessingJob
 from app.models.validation_result import ValidationResult
 
 _SOURCE_PREVIEW_CHARS = 240
@@ -112,6 +113,25 @@ class ArticleResponse(BaseModel):
 class GenerateArticleResponse(BaseModel):
     episode_id: uuid.UUID
     job_id: uuid.UUID
+
+
+class ArticleGenerationStatusResponse(BaseModel):
+    """Episode.status Decoupling: article-generation progress lives on
+    ProcessingJob.status now, never on Episode.status -- this is the
+    reviewer UI's replacement for polling Episode.status
+    (app/dev/review/[episodeId]/page.tsx used to poll for
+    ANALYZING/PLANNING/GENERATING/VERIFYING/REVISING, none of which
+    Episode.status is ever set to anymore). `status` is None when no
+    ARTICLE_GENERATION job has ever been created for this episode."""
+
+    status: JobStatus | None
+    error_message: str | None
+
+    @classmethod
+    def from_model(cls, job: ProcessingJob | None) -> "ArticleGenerationStatusResponse":
+        if job is None:
+            return cls(status=None, error_message=None)
+        return cls(status=job.status, error_message=job.error_message)
 
 
 # --- Public (published-articles-only) responses ------------------------------------------

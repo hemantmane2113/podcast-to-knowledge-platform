@@ -168,7 +168,9 @@ async def test_generate_article_with_multiple_historical_failed_jobs_does_not_50
         assert historical.status == JobStatus.FAILED
 
 
-async def _seed_completed_article(session: AsyncSession, episode: Episode, transcript: Transcript) -> None:
+async def _seed_completed_article(
+    session: AsyncSession, episode: Episode, transcript: Transcript, *, is_draft: bool = False
+) -> None:
     await ChunkRepository(session).replace_all(
         transcript_id=transcript.id,
         episode_id=episode.id,
@@ -185,11 +187,21 @@ async def _seed_completed_article(session: AsyncSession, episode: Episode, trans
     )
     await session.commit()
     plan = await ArticlePlanRepository(session).replace(
-        episode_id=episode.id, title="p", introduction_summary="i", conclusion_summary="c", sections=[]
+        episode_id=episode.id,
+        title="p",
+        introduction_summary="i",
+        conclusion_summary="c",
+        sections=[],
+        is_draft=is_draft,
     )
     await session.commit()
     await ArticleRepository(session).replace(
-        episode_id=episode.id, article_plan_id=plan.id, title="The Article", revision_count=0, sections=[]
+        episode_id=episode.id,
+        article_plan_id=plan.id,
+        title="The Article",
+        revision_count=0,
+        sections=[],
+        is_draft=is_draft,
     )
     await session.commit()
 
@@ -255,9 +267,18 @@ async def test_regenerate_article_enqueues_a_fresh_job_when_nothing_exists_yet(d
     assert queue.enqueued_article_generation[0][0] == episode.id
 
 
-async def test_regenerate_article_removes_plan_article_sections_and_validation_but_keeps_topics_and_chunks(
+async def test_regenerate_article_keeps_the_live_article_untouched_and_removes_only_a_stale_draft(
     db_session: AsyncSession,
 ) -> None:
+    """Live/Draft Article Workflow: a regeneration must never touch the
+    published episode's live Article/ArticlePlan/ArticleSections/
+    ValidationResults -- only a stale DRAFT (left over from an earlier
+    draft run) is removed, so app/ai/nodes/planning.py's resumability
+    check is forced to call the planner again for the new draft run
+    instead of silently reusing stale draft state. This replaces the old
+    pre-Live/Draft-Workflow test of the same shape, which asserted the
+    (now intentionally different) opposite: that regeneration deleted the
+    live article outright."""
     episode, transcript = await _seed_episode_and_transcript(db_session)
 
     chunk = (
@@ -289,14 +310,16 @@ async def test_regenerate_article_removes_plan_article_sections_and_validation_b
     article_repo = ArticleRepository(db_session)
     validation_repo = ValidationResultRepository(db_session)
 
-    plan = await plan_repo.replace(
-        episode_id=episode.id, title="p", introduction_summary="i", conclusion_summary="c", sections=[]
+    # The published episode's LIVE article -- must survive regeneration
+    # completely untouched.
+    live_plan = await plan_repo.replace(
+        episode_id=episode.id, title="live p", introduction_summary="i", conclusion_summary="c", sections=[]
     )
     await db_session.commit()
-    article = await article_repo.replace(
+    live_article = await article_repo.replace(
         episode_id=episode.id,
-        article_plan_id=plan.id,
-        title="The Article",
+        article_plan_id=live_plan.id,
+        title="The Live Article",
         revision_count=0,
         sections=[
             ArticleSectionCandidate(
@@ -305,9 +328,30 @@ async def test_regenerate_article_removes_plan_article_sections_and_validation_b
         ],
     )
     await db_session.commit()
-    validation_repo.create(article_id=article.id, passed=True, checks=[])
+    validation_repo.create(article_id=live_article.id, passed=True, checks=[])
     await db_session.commit()
-    old_article_id = article.id
+    live_article_id = live_article.id
+
+    # A stale DRAFT left over from an earlier draft run -- this is the one
+    # thing request_regeneration should remove.
+    stale_draft_plan = await plan_repo.replace(
+        episode_id=episode.id,
+        title="stale draft p",
+        introduction_summary="i",
+        conclusion_summary="c",
+        sections=[],
+        is_draft=True,
+    )
+    await db_session.commit()
+    await article_repo.replace(
+        episode_id=episode.id,
+        article_plan_id=stale_draft_plan.id,
+        title="Stale Draft Article",
+        revision_count=0,
+        sections=[],
+        is_draft=True,
+    )
+    await db_session.commit()
 
     jobs = ProcessingJobRepository(db_session)
     completed_job = jobs.create(episode_id=episode.id, job_type=JobType.ARTICLE_GENERATION)
@@ -329,11 +373,21 @@ async def test_regenerate_article_removes_plan_article_sections_and_validation_b
     assert len(queue.enqueued_article_generation) == 1
     assert queue.enqueued_article_generation[0] == (episode.id, new_job_id)
 
-    # ArticlePlan/Article/ArticleSections/ValidationResults are gone,
-    # through the FK ON DELETE CASCADE triggered by deleting the plan.
-    assert await plan_repo.get_by_episode_id(episode.id) is None
-    assert await article_repo.get_by_episode_id(episode.id) is None
-    assert await validation_repo.get_latest_by_article_id(old_article_id) is None
+    # The LIVE plan/article/sections/validation are all still exactly as
+    # they were -- request_regeneration never touches them.
+    still_live_plan = await plan_repo.get_by_episode_id(episode.id, is_draft=False)
+    assert still_live_plan is not None
+    assert still_live_plan.id == live_plan.id
+    still_live_article = await article_repo.get_by_episode_id(episode.id, is_draft=False)
+    assert still_live_article is not None
+    assert still_live_article.id == live_article_id
+    assert len(still_live_article.sections) == 1
+    assert await validation_repo.get_latest_by_article_id(live_article_id) is not None
+
+    # The stale DRAFT plan/article are gone, through the FK ON DELETE
+    # CASCADE triggered by deleting the draft plan.
+    assert await plan_repo.get_by_episode_id(episode.id, is_draft=True) is None
+    assert await article_repo.get_by_episode_id(episode.id, is_draft=True) is None
 
     # Topics and Chunks are untouched -- neither is reached by that cascade.
     topics = await TopicRepository(db_session).get_by_transcript_id(transcript.id)
@@ -415,12 +469,15 @@ async def test_request_regeneration_expires_stale_already_loaded_article_objects
     `loaded_article` below would keep silently returning its pre-delete
     attribute values instead of reflecting the deletion -- exactly the
     class of bug this codebase has hit before with a Core DELETE and a
-    stale identity map."""
+    stale identity map. Seeds a DRAFT article (not live) -- Live/Draft
+    Article Workflow: request_regeneration only ever deletes a stale
+    draft, so that's the object whose identity-map staleness is at risk
+    here."""
     episode, transcript = await _seed_episode_and_transcript(db_session)
-    await _seed_completed_article(db_session, episode, transcript)
+    await _seed_completed_article(db_session, episode, transcript, is_draft=True)
 
     article_repo = ArticleRepository(db_session)
-    loaded_article = await article_repo.get_by_episode_id(episode.id)
+    loaded_article = await article_repo.get_by_episode_id(episode.id, is_draft=True)
     assert loaded_article is not None
 
     service = ArticleService(db_session, FakeJobQueue())
@@ -437,7 +494,7 @@ async def test_request_regeneration_expires_stale_already_loaded_article_objects
 
     # And the row is genuinely gone, not just marked expired: a fresh
     # query (not a reload of this specific stale instance) confirms it.
-    assert await article_repo.get_by_episode_id(episode.id) is None
+    assert await article_repo.get_by_episode_id(episode.id, is_draft=True) is None
 
 
 # --- publish_article / POST publish ----------------------------------------------------

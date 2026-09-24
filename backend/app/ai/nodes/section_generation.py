@@ -23,7 +23,6 @@ from app.ai.schemas import GeneratedSection
 from app.ai.state import ArticlePipelineState, PipelineDeps
 from app.config.settings import Settings
 from app.models.chunk import Chunk
-from app.models.episode import ProcessingStatus
 from app.models.topic import Topic
 from app.providers.llm.base import LLMMessage
 from app.repositories.article_repository import ArticleSectionCandidate
@@ -185,10 +184,12 @@ async def generate_section(
 
 def build(deps: PipelineDeps):
     async def section_generation_node(state: ArticlePipelineState) -> dict:
+        # episode is fetched for EpisodeContext (below), not for status
+        # tracking -- article-generation progress lives on ProcessingJob.status
+        # now, never on Episode.status (Episode.status Decoupling /
+        # Live-Draft Article Workflow), so a draft regeneration can never
+        # overwrite a currently-PUBLISHED episode's publication state.
         episode = await deps.episodes.get_by_id(state["episode_id"])
-        if episode is not None:
-            deps.episodes.set_status(episode, ProcessingStatus.GENERATING)
-            await deps.session.commit()
 
         episode_context = (
             EpisodeContext(title=episode.title, channel_name=episode.channel_name)
@@ -211,6 +212,7 @@ def build(deps: PipelineDeps):
             article_plan_id=plan.id,
             title=plan.title,
             revision_count=state.get("revision_count", 0),
+            is_draft=state["is_draft"],
         )
         await deps.session.commit()
 

@@ -70,6 +70,7 @@ async def test_real_llm_produces_a_reviewable_article(db_session: AsyncSession) 
         "transcript_word_count": sum(len(c.text.split()) for c in chunks),
         "revision_count": 0,
         "max_revision_attempts": settings.max_revision_attempts,
+        "is_draft": True,
     }
 
     final_state = await run_article_pipeline(deps, initial_state)

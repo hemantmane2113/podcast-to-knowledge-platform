@@ -51,6 +51,16 @@ class ArticlePipelineState(TypedDict, total=False):
     transcript_id: uuid.UUID
     chunks: list[Chunk]
     transcript_word_count: int
+    # Live/Draft Article Workflow: whether this pipeline run is writing
+    # into the episode's DRAFT ArticlePlan/Article (True) or its LIVE one
+    # (False) -- threaded into every ArticlePlanRepository/ArticleRepository
+    # call the nodes make (app/ai/nodes/planning.py, section_generation.py,
+    # revision.py), so a draft run can never accidentally retrieve or
+    # overwrite the live row. app/worker/tasks.py::generate_article always
+    # sets this to True -- every run reached through the regenerate/generate
+    # API always targets a draft; only ArticleService.promote_draft ever
+    # makes something live.
+    is_draft: bool
 
     topics: list[Topic]
     plan: ArticlePlan

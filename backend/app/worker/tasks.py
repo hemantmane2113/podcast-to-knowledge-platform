@@ -266,11 +266,17 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                 llm_provider = None
 
         if llm_provider is None:
+            # Same Episode.status Decoupling rationale as the CancelledError/
+            # Exception handlers below -- this failure happens before any
+            # pipeline state exists, but it's still a generate_article
+            # failure path, so it must never overwrite a currently-PUBLISHED
+            # episode's publication state either.
             await _mark_failed(
                 session,
                 episode_uuid,
                 job_uuid,
                 "LLM provider is not configured (check LLM_PROVIDER and its API key).",
+                update_episode_status=False,
             )
             return
 
@@ -300,6 +306,13 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                 "transcript_word_count": sum(len(c.text.split()) for c in chunks),
                 "revision_count": 0,
                 "max_revision_attempts": settings.max_revision_attempts,
+                # Live/Draft Article Workflow: every run reached through
+                # this task (generate-article or regenerate-article) always
+                # targets the episode's DRAFT plan/article -- the live one
+                # is only ever replaced by an explicit
+                # ArticleService.promote_draft call, never by generation
+                # itself.
+                "is_draft": True,
             }
             final_state = await run_article_pipeline(deps, initial_state)
         except asyncio.CancelledError:
@@ -327,8 +340,11 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
             # falls straight to its terminal-failure branch). If arq does
             # retry this job_id, the next invocation's mark_running() above
             # immediately overwrites this with RUNNING again (harmless); if
-            # this was actually terminal, FAILED is correct instead of a
-            # permanent, unrecoverable ANALYZING/RUNNING. Never swallow the
+            # this was actually terminal, the job's FAILED status is correct
+            # instead of a permanent, unrecoverable RUNNING (update_episode_status
+            # =False below: Episode.status is no longer part of what could
+            # get stuck here at all -- see _mark_failed's docstring). Never
+            # swallow the
             # cancellation itself -- re-raise so arq observes it as it
             # expects.
             await session.rollback()
@@ -337,7 +353,9 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                 episode_id,
                 ctx.get("job_try"),
             )
-            await _mark_failed(session, episode_uuid, job_uuid, _GENERIC_ARTICLE_FAILURE_MESSAGE)
+            await _mark_failed(
+                session, episode_uuid, job_uuid, _GENERIC_ARTICLE_FAILURE_MESSAGE, update_episode_status=False
+            )
             raise
         except Exception as exc:
             await session.rollback()
@@ -361,20 +379,24 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
                 _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE),
             )
             await _mark_failed(
-                session, episode_uuid, job_uuid, _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE)
+                session,
+                episode_uuid,
+                job_uuid,
+                _safe_message(exc, generic=_GENERIC_ARTICLE_FAILURE_MESSAGE),
+                update_episode_status=False,
             )
             return
 
-        episodes = EpisodeRepository(session)
-        episode = await episodes.get_by_id(episode_uuid)
-        if episode is not None:
-            # READY_FOR_REVIEW regardless of whether validation passed --
-            # a failing article still needs to reach a reviewable state
-            # (Phase I), not be silently dropped. The validation result
-            # itself (persisted by the validation node) tells a reviewer
-            # which checks failed.
-            episodes.set_status(episode, ProcessingStatus.READY_FOR_REVIEW)
-
+        # The draft reaching a terminal state -- regardless of whether
+        # validation passed -- is recorded on ProcessingJob.status
+        # (COMPLETED below), never on Episode.status (Episode.status
+        # Decoupling / Live-Draft Article Workflow): a failing draft still
+        # needs to reach a reviewable state (Phase I), not be silently
+        # dropped, but it must never overwrite a currently-PUBLISHED
+        # episode's publication state. The validation result itself
+        # (persisted by the validation node) tells a reviewer which checks
+        # failed; GET /episodes/{id}/article?draft=true is how a reviewer
+        # retrieves the draft (app/api/v1/articles.py).
         job = await jobs.get_by_id(job_uuid)
         if job is not None:
             jobs.mark_completed(job)
@@ -388,15 +410,28 @@ async def generate_article(ctx: dict, episode_id: str, job_id: str) -> None:
         )
 
 
-async def _mark_failed(session, episode_id: uuid.UUID, job_id: uuid.UUID, message: str) -> None:
-    episodes = EpisodeRepository(session)
+async def _mark_failed(
+    session, episode_id: uuid.UUID, job_id: uuid.UUID, message: str, *, update_episode_status: bool = True
+) -> None:
+    """`update_episode_status` defaults to True, preserving this
+    function's original behavior for ingest_episode_transcript/
+    process_transcript, both of which run before any article exists and
+    have no publication state to protect. generate_article's own failure
+    paths (and app/worker/settings.py::_recover_stale_article_generation_jobs,
+    which routes stale ARTICLE_GENERATION jobs through this same function)
+    pass update_episode_status=False -- a draft-generation failure is
+    recorded on ProcessingJob.status/error_message only, never on
+    Episode.status, so it can never overwrite a currently-PUBLISHED
+    episode's publication state (Episode.status Decoupling / Live-Draft
+    Article Workflow)."""
     jobs = ProcessingJobRepository(session)
-
-    episode = await episodes.get_by_id(episode_id)
     job = await jobs.get_by_id(job_id)
 
-    if episode is not None:
-        episodes.set_status(episode, ProcessingStatus.FAILED, last_error=message)
+    if update_episode_status:
+        episodes = EpisodeRepository(session)
+        episode = await episodes.get_by_id(episode_id)
+        if episode is not None:
+            episodes.set_status(episode, ProcessingStatus.FAILED, last_error=message)
     if job is not None:
         jobs.mark_failed(job, message)
 
