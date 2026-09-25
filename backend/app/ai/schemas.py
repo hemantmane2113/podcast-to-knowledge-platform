@@ -1,0 +1,204 @@
+"""Structured LLM I/O schemas for the article pipeline (Phase C/E/F).
+
+Chunks and topics are referenced by small integers (a chunk's position in
+the batch sent to the model, a topic's `sequence_number`), never by raw
+UUID -- models reliably mangle/hallucinate UUIDs but handle small integers
+well. app/ai/nodes/ resolves these integers back to real database UUIDs
+before anything is persisted; nothing in this module or in the prompts
+ever asks the model to invent or transcribe an ID.
+"""
+
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+from app.services.article_validation import generation_artifact_match, repair_mojibake
+
+
+class TopicClaim(BaseModel):
+    text: str
+    speaker: str | None = None
+    claim_type: Literal["fact", "opinion", "speculation"] = "opinion"
+
+
+class TopicItem(BaseModel):
+    title: str
+    summary: str
+    # Positions (0-based) into the numbered chunk list given in the
+    # prompt for this batch -- see app/ai/nodes/topic_analysis.py, which
+    # offsets these to global chunk-list indices before persisting.
+    chunk_sequence_numbers: list[int] = Field(default_factory=list)
+    key_claims: list[TopicClaim] = Field(default_factory=list)
+    subtopics: list[str] = Field(default_factory=list)
+
+
+class TopicAnalysisResult(BaseModel):
+    topics: list[TopicItem]
+
+
+class TopicMergeGroup(BaseModel):
+    """Two or more boundary-candidate topics (see
+    app/ai/nodes/topic_analysis.py's _boundary_candidate_indices) that the
+    model has decided are the same topic split across a batch boundary.
+    `topic_indices` refers to the index each candidate was given in the
+    boundary-merge prompt -- never a raw UUID (same reasoning as
+    TopicItem.chunk_sequence_numbers above).
+
+    Deliberately narrow: only the two fields that are genuinely a semantic
+    judgment (a new title/summary covering the merged topic) come from the
+    model. chunk_sequence_numbers, key_claims, and subtopics for the
+    merged topic are always reconstructed in Python from the ORIGINAL
+    topics being merged, never taken from the model's response -- so the
+    model has no opportunity to drop a chunk reference or a claim, even
+    accidentally.
+    """
+
+    topic_indices: list[int] = Field(default_factory=list)
+    merged_title: str
+    merged_summary: str
+
+
+class TopicMergeDecision(BaseModel):
+    """Response schema for the boundary-scoped topic merge call. Empty
+    `merges` means none of the boundary candidates should merge -- every
+    one of them is kept as its own original topic."""
+
+    merges: list[TopicMergeGroup] = Field(default_factory=list)
+
+
+class PlannedSection(BaseModel):
+    heading: str
+    key_ideas: list[str] = Field(default_factory=list)
+    # References into the topic list given in the prompt, by each topic's
+    # own (already-persisted, stable) sequence_number.
+    supporting_topic_sequence_numbers: list[int] = Field(default_factory=list)
+    viewpoints: list[str] = Field(default_factory=list)
+    attribution_notes: list[str] = Field(default_factory=list)
+    # Editorial planning notes (free text, not a rigid enum -- the
+    # transcript determines the actual structure, this just carries the
+    # planner's own reasoning forward to section_generation_prompt so a
+    # section isn't written from a heading alone). Both default to "" --
+    # backward compatible with an already-persisted ArticlePlan.sections
+    # row from before this field existed (see app/ai/nodes/section_generation.py's
+    # planned_section.get(..., "") reads) and with existing test fixtures
+    # that construct a PlannedSection without them.
+    narrative_purpose: str = Field(
+        default="",
+        description=(
+            "One sentence, in your own words, explaining this section's editorial role in the "
+            'article -- e.g. "Establish the central principle that anchors the rest of the article." '
+            "Not a category label."
+        ),
+    )
+    transition_from_previous: str = Field(
+        default="",
+        description=(
+            "One sentence explaining why this section naturally follows the previous one -- what "
+            "makes it the next step for the reader, not just the next topic on a list. Blank for the "
+            "first section."
+        ),
+    )
+
+
+class ArticlePlanResult(BaseModel):
+    title: str
+    introduction_summary: str
+    sections: list[PlannedSection]
+    conclusion_summary: str
+
+
+class GeneratedSection(BaseModel):
+    """An ephemeral LLM output schema -- never persisted directly.
+    app/ai/nodes/section_generation.py joins `paragraphs` with "\\n\\n"
+    into ArticleSection.content (a single Text column, unchanged) at the
+    persistence boundary, so this shape change requires no migration and
+    no change to how content is stored or read back.
+
+    `paragraphs` (one string per paragraph) replaces a single opaque
+    `content` blob so paragraph boundaries are an explicit part of the
+    model's own output -- rather than inferred after the fact from
+    "\\n\\n" -- which is what app/services/article_validation.py's
+    paragraph-level checks (check_no_duplicate_paragraphs,
+    check_repeated_paragraph_openings) rely on.
+
+    Rejects a paragraph that matches a known generation-artifact pattern
+    (app/services/article_validation.py::generation_artifact_match) --
+    e.g. the model narrating its own generation/validation process
+    ("paragraphs continuation error") instead of writing real prose. This
+    is the ROOT-CAUSE fix, not a final safety net: raising here (a
+    Pydantic ValidationError) is what actually triggers
+    ChatCompletionsProvider.generate_structured's existing
+    corrective-retry loop (app/providers/llm/_chat_completions.py) --
+    before this validator existed, a syntactically-valid-but-garbage
+    response satisfied the old "non-empty" check on the FIRST attempt and
+    never got retried at all.
+
+    Also repairs mojibake (app/services/article_validation.py::repair_mojibake)
+    in each paragraph before the artifact check -- a real generated article
+    contained "Hubermanâs" where the source text (or the model's own
+    output) already had UTF-8-as-cp1252 mis-decoded characters. Repaired
+    here, not downstream, since investigation found no encoding bug
+    anywhere in this codebase's own serialization/transport code (see
+    repair_mojibake's docstring) -- the corruption is content, the same
+    category as a generation artifact, not a bug in how we store or serve
+    it."""
+
+    heading: str
+    paragraphs: list[str]
+
+    @field_validator("paragraphs")
+    @classmethod
+    def _paragraphs_are_non_empty_prose(cls, value: list[str]) -> list[str]:
+        cleaned = [repair_mojibake(p.strip()) for p in value if p.strip()]
+        if not cleaned:
+            raise ValueError("paragraphs must contain at least one non-empty paragraph")
+        for paragraph in cleaned:
+            artifact = generation_artifact_match(paragraph)
+            if artifact is not None:
+                raise ValueError(
+                    f"paragraph looks like a generation artifact ({artifact!r}), not article prose -- "
+                    "write the actual paragraph content, never commentary about the response format "
+                    "or a previous error"
+                )
+        return cleaned
+
+
+class SectionEditorialFeedback(BaseModel):
+    """One section the whole-article editorial review (Batch 5) has
+    identified a genuine article-level problem with -- cross-section
+    repetition, a weak transition, disproportionate length, an
+    under/over-explained idea, and so on. `feedback` must be specific
+    enough for app/ai/nodes/revision.py to hand straight to
+    generate_section() as revision_feedback, the same way a failed
+    deterministic check's own detail text already is."""
+
+    sequence_number: int
+    feedback: str
+
+
+class ArticleEditorialReview(BaseModel):
+    """Optional, whole-article editorial review (Settings.enable_llm_validation)
+    -- reads the ASSEMBLED article (never the raw transcript, never a new
+    retrieval mechanism) to catch what section-by-section generation
+    structurally cannot see: repetition between non-adjacent sections, weak
+    transitions, disproportionate section length, an introduction that
+    doesn't establish the central question, a conclusion that just
+    repeats, and where the soft word-count target calls for tightening
+    rather than uniform shortening (app/ai/prompts.py::article_editorial_review_prompt
+    has the exact instructions).
+
+    `coherent`/`notes` remain purely advisory, exactly as the prior
+    LLMCoherenceReview -- appended to the persisted `checks` for a human
+    reviewer, never folded into ValidationReport.passed
+    (app/services/article_validation.py stays entirely deterministic).
+    `sections_needing_revision`/`overall_feedback` are the new, ACTIONABLE
+    part: app/ai/graph.py's _should_revise and app/ai/nodes/revision.py
+    read them to target the SAME existing per-section revision mechanism a
+    failed deterministic check already uses -- this review never rewrites
+    anything itself, it only decides what needs another look and why.
+    """
+
+    coherent: bool
+    notes: str
+    sections_needing_revision: list[SectionEditorialFeedback] = Field(default_factory=list)
+    overall_feedback: str = ""

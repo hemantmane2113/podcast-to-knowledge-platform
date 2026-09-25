@@ -1,0 +1,94 @@
+import uuid
+from datetime import UTC, datetime
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.processing_job import JobStatus, JobType, ProcessingJob
+
+
+class ProcessingJobRepository:
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def get_by_id(self, job_id: uuid.UUID) -> ProcessingJob | None:
+        return await self._session.get(ProcessingJob, job_id)
+
+    async def get_active_job(
+        self, episode_id: uuid.UUID, job_type: JobType
+    ) -> ProcessingJob | None:
+        """The newest PENDING/RUNNING job, if any. More than one active row
+        can genuinely exist for the same (episode_id, job_type) -- nothing
+        enforces uniqueness at the DB level, and a worker process dying
+        mid-job (rather than going through its own except-block) leaves a
+        row stuck at PENDING/RUNNING forever. `.order_by(...).limit(1)`
+        makes `scalar_one_or_none()` safe (at most one row can come back);
+        without it, a second stuck active row raises MultipleResultsFound
+        -- found via a real production DB with historical jobs."""
+        result = await self._session.execute(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.episode_id == episode_id,
+                ProcessingJob.job_type == job_type,
+                ProcessingJob.status.in_((JobStatus.PENDING, JobStatus.RUNNING)),
+            )
+            .order_by(ProcessingJob.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_stale_active_jobs(
+        self, job_type: JobType, *, running_cutoff: datetime, pending_cutoff: datetime
+    ) -> list[ProcessingJob]:
+        """RUNNING jobs whose started_at predates `running_cutoff`, or
+        PENDING jobs whose created_at predates `pending_cutoff` -- jobs
+        that cannot possibly still be legitimately in progress (their
+        worker process was killed/restarted before ever reaching a
+        terminal status; see app/worker/settings.py's stale-job
+        reconciliation, which calls this on worker startup)."""
+        result = await self._session.execute(
+            select(ProcessingJob).where(
+                ProcessingJob.job_type == job_type,
+                or_(
+                    and_(ProcessingJob.status == JobStatus.RUNNING, ProcessingJob.started_at < running_cutoff),
+                    and_(ProcessingJob.status == JobStatus.PENDING, ProcessingJob.created_at < pending_cutoff),
+                ),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_latest_job(
+        self, episode_id: uuid.UUID, job_type: JobType
+    ) -> ProcessingJob | None:
+        result = await self._session.execute(
+            select(ProcessingJob)
+            .where(ProcessingJob.episode_id == episode_id, ProcessingJob.job_type == job_type)
+            .order_by(ProcessingJob.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    def create(self, episode_id: uuid.UUID, job_type: JobType) -> ProcessingJob:
+        job = ProcessingJob(
+            id=uuid.uuid4(),
+            episode_id=episode_id,
+            job_type=job_type,
+            status=JobStatus.PENDING,
+        )
+        self._session.add(job)
+        return job
+
+    def mark_running(self, job: ProcessingJob) -> None:
+        job.status = JobStatus.RUNNING
+        if job.started_at is None:
+            # Preserve the original start time across retry attempts.
+            job.started_at = datetime.now(UTC)
+
+    def mark_completed(self, job: ProcessingJob) -> None:
+        job.status = JobStatus.COMPLETED
+        job.completed_at = datetime.now(UTC)
+
+    def mark_failed(self, job: ProcessingJob, error_message: str) -> None:
+        job.status = JobStatus.FAILED
+        job.completed_at = datetime.now(UTC)
+        job.error_message = error_message
