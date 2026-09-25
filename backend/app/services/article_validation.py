@@ -70,6 +70,16 @@ _MIN_ARTICLE_WORDS = 100
 # not to merely strip artifact text as a first resort.
 _GENERATION_ARTIFACT_PATTERNS = (
     re.compile(r"\bparagraphs?\s+continuation\b", re.IGNORECASE),
+    # A second, real generated article (post-fix) surfaced a different word
+    # form of the same failure mode: "paragraphs continued?" -- the model
+    # narrating whether it should keep writing, rather than "paragraphs
+    # continuation [error|invalid]" narrating a validation failure. Same
+    # meta-commentary-about-the-response category, just a different verb
+    # form the original pattern didn't cover. Deliberately requires
+    # "continued" immediately after "paragraph(s)" (not just "continued"
+    # anywhere) so it can never match unrelated prose that happens to use
+    # that word (e.g. "the tradition continued for decades").
+    re.compile(r"\bparagraphs?\s+continued\b", re.IGNORECASE),
     re.compile(r"\bcontinuation\s+(?:error|invalid|failed)\b", re.IGNORECASE),
     re.compile(r"\b(?:json|schema)\s+validation\s+(?:error|failed)\b", re.IGNORECASE),
     re.compile(r"\bas an ai (?:language model|assistant)\b", re.IGNORECASE),
@@ -93,6 +103,56 @@ def generation_artifact_match(text: str) -> str | None:
         if match:
             return match.group(0)
     return None
+
+
+# Mojibake repair: a real generated article contained "Hubermanâs",
+# "âsomething hereâ" etc., where the source (either the transcript text a
+# section quotes, or the model's own output) already contains classic
+# UTF-8-decoded-as-Windows-1252 mojibake -- e.g. a right single quote (U+2019,
+# UTF-8 bytes E2 80 99) misread one byte at a time as cp1252 becomes "â€™".
+# Investigated and ruled out as a bug in THIS codebase's own I/O before
+# adding this: there is no manual `.encode(`/`.decode(` or charset override
+# anywhere in backend/app -- httpx (LLM providers + Supadata transcript
+# fetches), asyncpg (DB), Starlette's JSONResponse, and the frontend's plain
+# `fetch().json()` are all UTF-8-correct by default and none of them is
+# overridden. That rules out every serialization/transport boundary this
+# codebase controls, which leaves the raw text itself (as returned by the
+# LLM, possibly echoing already-corrupted transcript text) as the only
+# remaining source -- the same category of problem as
+# generation_artifact_match above, fixed at the same generation boundary
+# (app/ai/schemas.py::GeneratedSection) rather than downstream.
+#
+# Two single-byte codecs are tried, cp1252 and latin-1 (ISO-8859-1), since
+# either is a plausible real-world mis-decode and they're mutually
+# exclusive by construction: cp1252 repurposes bytes 0x80-0x9F for visible
+# punctuation (a right single quote comes back as "â€™" -- three visible
+# characters), while latin-1 maps those same bytes to the C1 control range
+# (the SAME right single quote comes back as "â" followed by two invisible
+# control characters -- "â" alone is what a human would actually see or
+# retype, matching the real report this was investigated from). Encoding
+# `text` under whichever codec did NOT originally produce it always raises
+# (proven experimentally: each codec's encode step rejects codepoints only
+# the other one's decode step can produce), so trying both in sequence
+# never risks the wrong repair being silently applied.
+#
+# The round trip (`text -> {cp1252,latin-1} bytes -> utf-8`) is
+# self-validating, not a blind character-replacement table: it only ever
+# changes `text` when re-decoding those bytes as UTF-8 actually succeeds,
+# which happens only when the text truly was UTF-8 mis-decoded as one of
+# these two codecs in the first place -- ordinary prose, including
+# genuinely accented names/words ("François", "café"), fails both
+# round trips (verified) and is returned unchanged.
+def repair_mojibake(text: str) -> str:
+    """Reverses UTF-8-decoded-as-cp1252 or UTF-8-decoded-as-latin-1
+    mojibake if `text` shows the pattern, otherwise returns `text`
+    unchanged."""
+    for source_codec in ("cp1252", "latin-1"):
+        try:
+            candidate = text.encode(source_codec).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        return candidate
+    return text
 
 # Relative-shortness signal for check_no_empty_sections (requirement #5):
 # a section under both the ratio AND the absolute floor relative to the

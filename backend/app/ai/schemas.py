@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.services.article_validation import generation_artifact_match
+from app.services.article_validation import generation_artifact_match, repair_mojibake
 
 
 class TopicClaim(BaseModel):
@@ -131,7 +131,17 @@ class GeneratedSection(BaseModel):
     corrective-retry loop (app/providers/llm/_chat_completions.py) --
     before this validator existed, a syntactically-valid-but-garbage
     response satisfied the old "non-empty" check on the FIRST attempt and
-    never got retried at all."""
+    never got retried at all.
+
+    Also repairs mojibake (app/services/article_validation.py::repair_mojibake)
+    in each paragraph before the artifact check -- a real generated article
+    contained "Hubermanâs" where the source text (or the model's own
+    output) already had UTF-8-as-cp1252 mis-decoded characters. Repaired
+    here, not downstream, since investigation found no encoding bug
+    anywhere in this codebase's own serialization/transport code (see
+    repair_mojibake's docstring) -- the corruption is content, the same
+    category as a generation artifact, not a bug in how we store or serve
+    it."""
 
     heading: str
     paragraphs: list[str]
@@ -139,7 +149,7 @@ class GeneratedSection(BaseModel):
     @field_validator("paragraphs")
     @classmethod
     def _paragraphs_are_non_empty_prose(cls, value: list[str]) -> list[str]:
-        cleaned = [p.strip() for p in value if p.strip()]
+        cleaned = [repair_mojibake(p.strip()) for p in value if p.strip()]
         if not cleaned:
             raise ValueError("paragraphs must contain at least one non-empty paragraph")
         for paragraph in cleaned:

@@ -29,6 +29,7 @@ from app.services.article_validation import (
     check_unsupported_content,
     generation_artifact_match,
     is_section_content_valid,
+    repair_mojibake,
     run_validation,
 )
 
@@ -202,6 +203,38 @@ def test_generation_artifact_match_detects_the_second_reported_artifact() -> Non
     assert generation_artifact_match("paragraphs continuation invalid") is not None
 
 
+def test_generation_artifact_match_detects_the_third_reported_artifact_paragraphs_continued() -> None:
+    # A second real generated article (after the first fix) surfaced a
+    # different word form of the same meta-commentary failure mode:
+    # "paragraphs continued?" (a verb, not the noun "continuation" the
+    # original pattern covered).
+    assert generation_artifact_match("paragraphs continued?") is not None
+    assert generation_artifact_match("paragraphs continued") is not None
+
+
+def test_generation_artifact_match_does_not_flag_legitimate_prose_mentioning_paragraphs() -> None:
+    # The same real article's section 10 legitimately discusses paragraphs
+    # as a topic ("paragraphs like 'chop wood, carry water' matter...") --
+    # the detector must stay narrow to "paragraph(s) continued/continuation",
+    # never a broad `"paragraphs" in text` rule that would reject this too.
+    legitimate = 'Short paragraphs like "chop wood, carry water" matter because they mirror everyday practice.'
+    assert generation_artifact_match(legitimate) is None
+    # Same sentence with the actual curly quotes the model would use, not
+    # straight ones -- proves the narrowness isn't an artifact of ASCII
+    # punctuation in the test fixture above.
+    legitimate_curly = "Short paragraphs like “chop wood, carry water” matter because they mirror everyday practice."
+    assert generation_artifact_match(legitimate_curly) is None
+
+
+def test_generation_artifact_match_does_not_flag_continued_unrelated_to_paragraphs() -> None:
+    # "continued" on its own, nowhere near "paragraph(s)", is ordinary
+    # prose (a tradition, a practice, a habit continuing) -- the pattern
+    # requires "paragraph(s)" immediately before "continued", never a bare
+    # "continued" anywhere in the text.
+    assert generation_artifact_match("The tradition continued for decades after the founder's death.") is None
+    assert generation_artifact_match("Training continued well into the evening, he said.") is None
+
+
 def test_generation_artifact_match_returns_none_for_real_prose() -> None:
     real_prose = (
         "The conversation turns to how sleep affects memory consolidation, with concrete "
@@ -260,6 +293,25 @@ def test_generated_section_schema_rejects_a_generation_artifact_paragraph() -> N
         GeneratedSection(heading="Intro", paragraphs=["paragraphs continuation error"])
 
 
+def test_generated_section_schema_rejects_the_paragraphs_continued_variant() -> None:
+    from pydantic import ValidationError
+
+    from app.ai.schemas import GeneratedSection
+
+    with pytest.raises(ValidationError, match="generation artifact"):
+        GeneratedSection(heading="Section 5", paragraphs=["Some real content here.", "paragraphs continued?"])
+
+
+def test_generated_section_schema_accepts_legitimate_prose_about_paragraphs() -> None:
+    from app.ai.schemas import GeneratedSection
+
+    section = GeneratedSection(
+        heading="Section 10",
+        paragraphs=['Short paragraphs like "chop wood, carry water" matter because they mirror practice.'],
+    )
+    assert "chop wood" in section.paragraphs[0]
+
+
 def test_generated_section_schema_accepts_real_prose() -> None:
     from app.ai.schemas import GeneratedSection
 
@@ -290,6 +342,105 @@ def test_run_validation_fails_the_whole_report_when_a_section_has_a_generation_a
     empty_check = next(c for c in report.checks if c.name == "no_empty_sections")
     assert empty_check.severity == FAILURE
     assert "generation artifact" in empty_check.details
+
+
+# --- mojibake repair (Live/Draft Article Workflow follow-up fix #2) ---------------------
+# Regression tests for a real observed defect: a generated article contained
+# "Hubermanâs", "âsomething hereâ" -- UTF-8 text mis-decoded as a
+# single-byte codec somewhere upstream of this pipeline (no encode/decode
+# call exists anywhere in this codebase's own I/O -- see repair_mojibake's
+# docstring), most consistent with a latin-1 mis-decode (the corrupted
+# bytes for the invisible C1 control characters a cp1252 mis-decode would
+# instead render as visible €/™-style characters, matching what was
+# actually reported: a bare "â" with nothing else visible around it).
+
+
+def test_repair_mojibake_fixes_the_exact_reported_huberman_apostrophe() -> None:
+    # The real reported string, "Hubermanâs", derived the same way the
+    # actual corruption happens (UTF-8 bytes for the apostrophe mis-decoded
+    # as latin-1) rather than hand-typed -- typing just the letter "â"
+    # would silently drop the two C1 control characters (U+0080, U+0099)
+    # that come along with a real latin-1 mis-decode and are invisible in
+    # a terminal/most fonts, which is exactly why the bug report only
+    # *showed* a bare "â": those two characters are genuinely part of the
+    # corrupted string, just not visible when printed or copy-pasted.
+    correct = "Huberman’s"
+    corrupted = correct.encode("utf-8").decode("latin-1")
+    # \xe2\x80\x99 in a str literal is three codepoints (U+00E2, U+0080,
+    # U+0099), matching what `corrupted` actually holds -- U+0080/U+0099
+    # are non-printable C1 controls, so `corrupted` PRINTS as "Hubermanâs"
+    # (verified: str.isprintable() is False, and stripping the two C1
+    # controls leaves exactly the visible "Hubermanâs" the bug report
+    # showed) even though it is a 12-character string, not an 8-character
+    # one with a single substituted letter.
+    assert corrupted == "Huberman\xe2\x80\x99s"
+    assert not corrupted.isprintable()
+    printable_only = "".join(ch for ch in corrupted if ch.isprintable())
+    assert printable_only == "Hubermanâs"
+    assert repair_mojibake(corrupted) == correct
+    assert repair_mojibake(corrupted) == "Huberman's".replace("'", "’")
+
+
+def test_repair_mojibake_fixes_the_exact_reported_neuroscientist_quote() -> None:
+    correct = "“nearly three decades as a neuroscientist”"
+    corrupted = correct.encode("utf-8").decode("latin-1")
+    printable_only = "".join(ch for ch in corrupted if ch.isprintable())
+    assert printable_only == "ânearly three decades as a neuroscientistâ"
+    assert repair_mojibake(corrupted) == correct
+
+
+def test_repair_mojibake_fixes_a_cp1252_misdecoded_apostrophe() -> None:
+    correct = "Huberman’s"
+    corrupted = correct.encode("utf-8").decode("cp1252")
+    assert repair_mojibake(corrupted) == correct
+
+
+def test_repair_mojibake_leaves_normal_ascii_prose_unchanged() -> None:
+    text = "This sentence has nothing unusual about it at all."
+    assert repair_mojibake(text) == text
+
+
+def test_repair_mojibake_leaves_genuinely_accented_text_unchanged() -> None:
+    # Real accented names/words, never a mis-decoded sequence -- both
+    # round-trip codecs must fail to re-decode as UTF-8 and fall back to
+    # the original text unchanged (verified: neither codec can reconstruct
+    # valid UTF-8 bytes from a single already-correct Unicode character).
+    text = "The guest, François, explained the concept clearly over café."
+    assert repair_mojibake(text) == text
+
+
+def test_repair_mojibake_leaves_genuine_curly_quotes_and_em_dash_unchanged() -> None:
+    # Correctly-encoded typographic punctuation (not mis-decoded) must
+    # round-trip unchanged -- proves the repair is narrowly self-validating
+    # rather than a blanket transform of anything in this character range.
+    text = "“This matters—deeply,” she said, ‘and so does that.’"
+    assert repair_mojibake(text) == text
+
+
+def test_repair_mojibake_is_idempotent_on_already_corrupted_text() -> None:
+    correct = "Huberman’s"
+    corrupted = correct.encode("utf-8").decode("latin-1")
+    once = repair_mojibake(corrupted)
+    twice = repair_mojibake(once)
+    assert once == correct
+    assert twice == once
+
+
+def test_repair_mojibake_is_idempotent_on_already_correct_text() -> None:
+    text = "“nearly three decades as a neuroscientist,” Huberman’s work — all correct."
+    once = repair_mojibake(text)
+    twice = repair_mojibake(once)
+    assert once == text
+    assert twice == text
+
+
+def test_generated_section_schema_repairs_mojibake_in_a_paragraph() -> None:
+    from app.ai.schemas import GeneratedSection
+
+    correct = "Huberman’s research spans nearly three decades."
+    corrupted = correct.encode("utf-8").decode("latin-1")
+    section = GeneratedSection(heading="Intro", paragraphs=[corrupted])
+    assert section.paragraphs == [correct]
 
 
 # --- duplicate sections ------------------------------------------------------------------
