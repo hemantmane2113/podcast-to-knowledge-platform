@@ -1,3 +1,26 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-paper text-ink;
+  }
+
+  a {
+    @apply underline-offset-4;
+  }
+
+  ::selection {
+    @apply bg-accent/20 text-ink;
+  }
+
+  *:focus-visible {
+    outline: 2px solid theme("colors.accent");
+    outline-offset: 2px;
+  }
+}
