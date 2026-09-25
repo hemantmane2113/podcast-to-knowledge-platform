@@ -1,4 +1,4 @@
-import type { PublicArticle } from "./api";
+import type { CardArticle, PublicArticle } from "./api";
 
 export function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString("en-US", {
@@ -31,4 +31,18 @@ export function firstParagraph(content: string, maxChars = 240): string {
   const clean = (first ?? "").trim();
   if (clean.length <= maxChars) return clean;
   return `${clean.slice(0, maxChars).replace(/\s+\S*$/, "")}…`;
+}
+
+// ArticleCard's props, derived from a real PublicArticle -- `category`
+// uses channel_name (the closest real categorization signal the API
+// provides; there is no dedicated topic/category field), only ever shown
+// when the API actually returned one.
+export function toCardArticle(article: PublicArticle): CardArticle {
+  return {
+    episodeId: article.episode_id,
+    title: article.title,
+    publishedAt: article.published_at,
+    minutes: readingTimeMinutes(articleWordCount(article)),
+    category: article.channel_name,
+  };
 }

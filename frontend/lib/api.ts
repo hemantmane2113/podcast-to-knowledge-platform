@@ -54,15 +54,26 @@ export async function getPublishedArticle(episodeId: string): Promise<PublicArti
   return response.json();
 }
 
-// Shared by the home page and the blog index: the newest published
-// article ("featured") plus the full list, fetched once so both pages
-// don't duplicate the same two-call sequence.
-export async function getFeaturedAndArticles(): Promise<{
-  featured: PublicArticle | null;
-  articles: PublicArticleSummary[];
-}> {
-  const articles = await getPublishedArticles();
-  const [latest] = articles;
-  const featured = latest ? await getPublishedArticle(latest.episode_id) : null;
-  return { featured, articles };
+// The list endpoint only returns id/title/published_at (see
+// PublicArticleSummaryResponse) -- no reading time, no channel/category.
+// The editorial card system (ArticleCard) needs both, so the discovery
+// pages fetch each article's own real detail response too, rather than
+// ever inventing a reading time or category. Fine at the catalog size
+// this product has today; revisit (e.g. a dedicated summary field on the
+// backend) if the published catalog grows large enough for N+1 detail
+// fetches to matter.
+export async function getPublishedArticlesWithDetails(): Promise<PublicArticle[]> {
+  const summaries = await getPublishedArticles();
+  const details = await Promise.all(summaries.map((s) => getPublishedArticle(s.episode_id)));
+  return details.filter((article): article is PublicArticle => article !== null);
 }
+
+// The exact, flat shape ArticleCard renders -- derived entirely from a
+// real PublicArticle, never fabricated.
+export type CardArticle = {
+  episodeId: string;
+  title: string;
+  publishedAt: string;
+  minutes: number | null;
+  category: string | null;
+};

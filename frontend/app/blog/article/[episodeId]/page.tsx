@@ -5,8 +5,8 @@ import { ArticleDisclaimer } from "@/components/ArticleDisclaimer";
 import { SiteFooter } from "@/components/SiteFooter";
 import { SiteHeader } from "@/components/SiteHeader";
 import { SourceAttribution } from "@/components/SourceAttribution";
-import { getPublishedArticle, getPublishedArticles } from "@/lib/api";
-import { articleWordCount, formatDate, readingTimeMinutes } from "@/lib/format";
+import { getPublishedArticle, getPublishedArticlesWithDetails } from "@/lib/api";
+import { articleWordCount, formatDate, readingTimeMinutes, toCardArticle } from "@/lib/format";
 
 export default async function BlogArticlePage({
   params,
@@ -14,7 +14,10 @@ export default async function BlogArticlePage({
   params: Promise<{ episodeId: string }>;
 }) {
   const { episodeId } = await params;
-  const [article, allArticles] = await Promise.all([getPublishedArticle(episodeId), getPublishedArticles()]);
+  const [article, allArticles] = await Promise.all([
+    getPublishedArticle(episodeId),
+    getPublishedArticlesWithDetails(),
+  ]);
 
   if (!article) {
     notFound();
@@ -22,6 +25,7 @@ export default async function BlogArticlePage({
 
   const minutes = readingTimeMinutes(articleWordCount(article));
   const nextArticle = allArticles.find((a) => a.episode_id !== article.episode_id) ?? null;
+  const nextCard = nextArticle ? toCardArticle(nextArticle) : null;
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -76,14 +80,16 @@ export default async function BlogArticlePage({
 
           <ArticleDisclaimer />
 
-          {nextArticle && (
+          {nextCard && (
             <div className="mt-14 border-t border-rule pt-10">
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-accent">Read Next</p>
-              <ul className="mt-4">
+              <ul className="mt-4 max-w-sm">
                 <ArticleCard
-                  episodeId={nextArticle.episode_id}
-                  title={nextArticle.title}
-                  publishedAt={nextArticle.published_at}
+                  episodeId={nextCard.episodeId}
+                  title={nextCard.title}
+                  publishedAt={nextCard.publishedAt}
+                  minutes={nextCard.minutes}
+                  category={nextCard.category}
                 />
               </ul>
             </div>
