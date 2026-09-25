@@ -29,11 +29,20 @@ export function SiteFooter() {
           ))}
         </nav>
 
-        <p className="mt-8 max-w-2xl text-xs leading-relaxed text-muted">
-          Conversely turns long-form conversations into readable essays. We don&apos;t claim the ideas as
-          our own. Articles are AI-generated summaries of source conversations and may not capture every
-          nuance or qualification. Please consult the original source for full context.
-        </p>
+        <div className="mt-8 max-w-2xl">
+          <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">Editorial Note</h2>
+          <p className="mt-3 text-xs leading-relaxed text-muted">
+            Conversely transforms long-form conversations and podcasts into readable articles using AI.
+            The ideas, opinions, claims, and perspectives discussed in these articles belong to the
+            original speakers and sources, not to Conversely. We do not claim ownership of or endorsement
+            of these views, nor do we independently verify every claim made in the original conversation.
+          </p>
+          <p className="mt-3 text-xs leading-relaxed text-muted">
+            These articles are intended for informational and educational purposes only and should not be
+            treated as professional, medical, financial, legal, or other expert advice. For complete
+            context, please refer to the original conversation.
+          </p>
+        </div>
       </div>
     </footer>
   );

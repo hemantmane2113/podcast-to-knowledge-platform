@@ -6,10 +6,20 @@ import Link from "next/link";
 // the right. Two columns on larger screens, stacked (text first) on
 // mobile. Text and image never overlap -- no copy is ever placed over
 // the image itself.
+//
+// Image container: a single wide aspect-[16/9] at every breakpoint (no
+// narrower override on desktop) so main.png reads as a clearly wide,
+// panoramic editorial image rather than a near-square card -- 16/9 is
+// also closer to main.png's own very wide native aspect than a narrower
+// ratio would be, so less of the image needs to be cropped away by
+// object-cover. The desktop grid is asymmetric (5fr text / 7fr image,
+// not an even 50/50 split) specifically so the wider image gets more
+// horizontal space to actually show that width, not just a wide aspect
+// ratio squeezed into a half-width column.
 export function HomeHero() {
   return (
     <section className="mx-auto max-w-6xl px-6 py-16 sm:py-20">
-      <div className="grid grid-cols-1 items-center gap-12 lg:grid-cols-2 lg:gap-16">
+      <div className="grid grid-cols-1 items-center gap-12 lg:grid-cols-[5fr_7fr] lg:gap-16">
         <div>
           <h1 className="font-serif text-4xl leading-tight text-ink sm:text-5xl lg:text-6xl">
             Long Conversations.
@@ -32,7 +42,7 @@ export function HomeHero() {
           </p>
         </div>
 
-        <div className="relative aspect-[16/9] overflow-hidden border border-rule lg:aspect-[4/3]">
+        <div className="relative aspect-[16/9] overflow-hidden border border-rule">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src="/images/articles/main.png" alt="" className="h-full w-full object-cover" />
         </div>
