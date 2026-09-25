@@ -1,5 +1,7 @@
 import uuid
 
+import pytest
+
 from app.models.article_plan import ArticlePlan
 from app.models.article_section import ArticleSection
 from app.models.chunk import Chunk
@@ -25,6 +27,8 @@ from app.services.article_validation import (
     check_source_coverage,
     check_source_traceability,
     check_unsupported_content,
+    generation_artifact_match,
+    is_section_content_valid,
     run_validation,
 )
 
@@ -182,6 +186,110 @@ def test_no_empty_sections_does_not_warn_for_a_legitimately_shorter_but_substant
         ]
     )
     assert result.severity == PASS
+
+
+# --- generation-artifact detection (Live/Draft Article Workflow follow-up fix) -----------
+# Regression tests for a real observed defect: the model's response leaking
+# meta-commentary about its own generation/validation process into what
+# should be article prose. Both literal reported artifacts are covered.
+
+
+def test_generation_artifact_match_detects_the_first_reported_artifact() -> None:
+    assert generation_artifact_match("paragraphs continuation error") is not None
+
+
+def test_generation_artifact_match_detects_the_second_reported_artifact() -> None:
+    assert generation_artifact_match("paragraphs continuation invalid") is not None
+
+
+def test_generation_artifact_match_returns_none_for_real_prose() -> None:
+    real_prose = (
+        "The conversation turns to how sleep affects memory consolidation, with concrete "
+        "examples drawn from the research discussed earlier in the episode."
+    )
+    assert generation_artifact_match(real_prose) is None
+
+
+def test_is_section_content_valid_rejects_a_generation_artifact_even_if_long_enough() -> None:
+    # Long enough to clear the plain length floor on its own -- the
+    # artifact pattern must still be what invalidates it, not length.
+    content = "paragraphs continuation error. " * 5
+    assert len(content) >= 50
+    assert not is_section_content_valid("Intro", content)
+
+
+def test_check_no_empty_sections_fails_for_a_generation_artifact_and_reports_it_specifically() -> None:
+    result = check_no_empty_sections([_section(content="paragraphs continuation invalid")])
+    assert not result.passed
+    assert result.severity == FAILURE
+    assert "generation artifact" in result.details
+    # The matched pattern text is included so a reviewer can see exactly
+    # what triggered this -- not necessarily the whole flagged sentence.
+    assert "paragraphs continuation" in result.details
+
+
+def test_check_no_empty_sections_only_flags_the_artifact_section_not_legitimate_ones() -> None:
+    # Proves the strengthened check doesn't over-reject: a genuinely short
+    # section is left alone (or only WARNs, per the existing relative-
+    # shortness logic), while an artifact-laden section in the SAME
+    # article is a hard FAILURE naming only itself.
+    normal = " ".join(["word"] * 900)
+    result = check_no_empty_sections(
+        [
+            _section(sequence_number=0, content="paragraphs continuation error"),
+            _section(sequence_number=1, content=normal),
+            _section(sequence_number=2, content=normal),
+        ]
+    )
+    assert result.severity == FAILURE
+    assert result.sections == (0,)
+
+
+def test_generated_section_schema_rejects_a_generation_artifact_paragraph() -> None:
+    """Root-cause fix, isolated from the retry-loop mechanics tested in
+    tests/unit/test_llm_providers.py: GeneratedSection's own Pydantic
+    validator (app/ai/schemas.py) rejects a paragraph matching a known
+    artifact pattern at construction time -- this is what turns a
+    syntactically-valid-but-garbage response into a ValidationError the
+    LLM provider's existing corrective-retry loop can actually act on."""
+    from pydantic import ValidationError
+
+    from app.ai.schemas import GeneratedSection
+
+    with pytest.raises(ValidationError, match="generation artifact"):
+        GeneratedSection(heading="Intro", paragraphs=["paragraphs continuation error"])
+
+
+def test_generated_section_schema_accepts_real_prose() -> None:
+    from app.ai.schemas import GeneratedSection
+
+    section = GeneratedSection(
+        heading="Intro", paragraphs=["A real paragraph discussing the podcast's actual content."]
+    )
+    assert section.paragraphs == ["A real paragraph discussing the podcast's actual content."]
+
+
+def test_run_validation_fails_the_whole_report_when_a_section_has_a_generation_artifact() -> None:
+    normal = " ".join(["word"] * 900)
+    sections = [
+        _section(sequence_number=0, content="paragraphs continuation error", supporting_chunk_ids=[]),
+        _section(sequence_number=1, content=normal, supporting_chunk_ids=[]),
+    ]
+    plan = _plan([{"sequence_number": 0}, {"sequence_number": 1}])
+    report = run_validation(
+        sections=sections,
+        plan=plan,
+        chunks=[],
+        topics=[],
+        transcript_word_count=10_000,
+        max_length_ratio=0.4,
+        min_sections=1,
+        max_sections=20,
+    )
+    assert not report.passed
+    empty_check = next(c for c in report.checks if c.name == "no_empty_sections")
+    assert empty_check.severity == FAILURE
+    assert "generation artifact" in empty_check.details
 
 
 # --- duplicate sections ------------------------------------------------------------------

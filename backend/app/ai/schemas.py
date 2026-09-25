@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.article_validation import generation_artifact_match
+
 
 class TopicClaim(BaseModel):
     text: str
@@ -117,7 +119,19 @@ class GeneratedSection(BaseModel):
     model's own output -- rather than inferred after the fact from
     "\\n\\n" -- which is what app/services/article_validation.py's
     paragraph-level checks (check_no_duplicate_paragraphs,
-    check_repeated_paragraph_openings) rely on."""
+    check_repeated_paragraph_openings) rely on.
+
+    Rejects a paragraph that matches a known generation-artifact pattern
+    (app/services/article_validation.py::generation_artifact_match) --
+    e.g. the model narrating its own generation/validation process
+    ("paragraphs continuation error") instead of writing real prose. This
+    is the ROOT-CAUSE fix, not a final safety net: raising here (a
+    Pydantic ValidationError) is what actually triggers
+    ChatCompletionsProvider.generate_structured's existing
+    corrective-retry loop (app/providers/llm/_chat_completions.py) --
+    before this validator existed, a syntactically-valid-but-garbage
+    response satisfied the old "non-empty" check on the FIRST attempt and
+    never got retried at all."""
 
     heading: str
     paragraphs: list[str]
@@ -128,6 +142,14 @@ class GeneratedSection(BaseModel):
         cleaned = [p.strip() for p in value if p.strip()]
         if not cleaned:
             raise ValueError("paragraphs must contain at least one non-empty paragraph")
+        for paragraph in cleaned:
+            artifact = generation_artifact_match(paragraph)
+            if artifact is not None:
+                raise ValueError(
+                    f"paragraph looks like a generation artifact ({artifact!r}), not article prose -- "
+                    "write the actual paragraph content, never commentary about the response format "
+                    "or a previous error"
+                )
         return cleaned
 
 

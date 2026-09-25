@@ -357,6 +357,75 @@ async def test_generate_structured_raises_after_two_failed_attempts() -> None:
     assert create.call_count == 2
 
 
+async def test_generate_structured_retries_a_generation_artifact_then_succeeds() -> None:
+    """Regression test for a real observed defect (Live/Draft Article
+    Workflow follow-up fix): the model's structured-output response can
+    leak meta-commentary about its own generation/validation process
+    into what should be article prose -- e.g. the literal reported
+    artifacts "paragraphs continuation error" / "paragraphs continuation
+    invalid" -- and it used to sail straight through on the FIRST
+    attempt, since GeneratedSection's own validator (app/ai/schemas.py)
+    previously only checked paragraphs were non-empty, never that they
+    read as real prose. That syntactically-valid-but-garbage response
+    never even reached this retry loop. Now GeneratedSection's validator
+    rejects it immediately, which DOES raise a ValidationError here and
+    IS caught by the existing retry loop -- exercised end to end against
+    the real production schema (not a test-only stand-in), through the
+    real ChatCompletionsProvider.generate_structured."""
+    from app.ai.schemas import GeneratedSection
+
+    artifact_response = json.dumps(
+        {"heading": "Intro", "paragraphs": ["paragraphs continuation error"]}
+    )
+    good_response = json.dumps(
+        {"heading": "Intro", "paragraphs": ["A real paragraph about the podcast's actual content."]}
+    )
+    create = AsyncMock(side_effect=[_fake_completion(artifact_response), _fake_completion(good_response)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    result = await provider.generate_structured(
+        messages=[LLMMessage(role="user", content="write the section")], response_model=GeneratedSection
+    )
+
+    assert result == GeneratedSection(
+        heading="Intro", paragraphs=["A real paragraph about the podcast's actual content."]
+    )
+    assert create.call_count == 2
+    # The retry prompt includes the bad output and an error explanation --
+    # same corrective-retry shape as any other validation failure, not a
+    # bespoke path.
+    second_call_messages = create.call_args_list[1].kwargs["messages"]
+    assert any("generation artifact" in m["content"] for m in second_call_messages)
+
+
+async def test_generate_structured_raises_when_both_attempts_are_generation_artifacts() -> None:
+    """The other literal reported artifact ("paragraphs continuation
+    invalid") -- if the model produces a generation artifact on BOTH
+    attempts, this must surface as a clear LLMStructuredOutputError
+    (caught by app/worker/tasks.py::generate_article's normal failure
+    handling), never silently persist the garbage as if it were a valid
+    section."""
+    from app.ai.schemas import GeneratedSection
+
+    artifact_response = json.dumps(
+        {"heading": "Intro", "paragraphs": ["paragraphs continuation invalid"]}
+    )
+    create = AsyncMock(return_value=_fake_completion(artifact_response))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    provider = _StubChatCompletionsProvider(client)
+
+    from app.providers.llm.base import LLMMessage
+
+    with pytest.raises(LLMStructuredOutputError):
+        await provider.generate_structured(
+            messages=[LLMMessage(role="user", content="write the section")], response_model=GeneratedSection
+        )
+    assert create.call_count == 2
+
+
 async def test_generate_structured_rejects_json_missing_required_fields() -> None:
     incomplete = json.dumps({"title": "missing count"})
     complete = json.dumps({"title": "ok", "count": 2})

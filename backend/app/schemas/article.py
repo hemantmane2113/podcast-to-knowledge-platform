@@ -12,6 +12,34 @@ from app.models.validation_result import ValidationResult
 _SOURCE_PREVIEW_CHARS = 240
 
 
+def _podcast_attribution_sentence(episode: Episode) -> str:
+    """Deterministic, code-generated -- never delegated to the LLM.
+    Appended as the article's final sentence at response-assembly time
+    (ArticleResponse/PublicArticleResponse.from_models below), never
+    persisted to ArticleSection.content: this keeps it completely outside
+    the generation/revision/resumability pipeline (app/ai/graph.py) --
+    zero risk of it being duplicated across revision rounds, zero risk of
+    it leaking into a later section's "preceding content" context
+    (app/ai/nodes/section_generation.py::excerpt_preceding_section), no
+    interaction with deterministic validation's word-count/paragraph
+    checks, and no migration/backfill needed for articles generated
+    before this existed -- every article, old or new, gets it on every
+    read. Built purely from Episode's own existing metadata (never a
+    specific show/host/guest name hardcoded) so this works identically
+    for every episode: youtube_url is always present (Episode.youtube_url
+    is NOT NULL); channel_name/title are used only when actually
+    populated (ingestion metadata isn't always complete), never
+    fabricated when absent, the same "never fabricate" rule
+    PublicArticleResponse's own source-metadata fields already follow."""
+    if episode.channel_name:
+        source = f"the podcast conversation from {episode.channel_name}"
+    elif episode.title:
+        source = f'the podcast episode "{episode.title}"'
+    else:
+        source = "the source podcast conversation"
+    return f"This article is based on {source}. Watch the full podcast here: {episode.youtube_url}"
+
+
 class SourceChunkResponse(BaseModel):
     """A section's evidence, resolved to real chunk data (not just a bare
     UUID) so a reviewer can jump straight to the timestamp -- Phase I's
@@ -71,14 +99,22 @@ class ArticleResponse(BaseModel):
     def from_models(
         cls,
         article: Article,
-        episode_status: ProcessingStatus,
+        episode: Episode,
         chunks_by_id: dict[uuid.UUID, Chunk],
     ) -> "ArticleResponse":
+        # article.sections is already ordered (relationship's own
+        # order_by="ArticleSection.sequence_number", app/models/article.py)
+        # -- list()'d once so the deterministic podcast attribution below
+        # can be appended to exactly the LAST one by index.
+        ordered_sections = list(article.sections)
+        attribution = _podcast_attribution_sentence(episode)
         sections = [
             ArticleSectionResponse(
                 sequence_number=s.sequence_number,
                 heading=s.heading,
-                content=s.content,
+                content=(
+                    f"{s.content}\n\n{attribution}" if i == len(ordered_sections) - 1 else s.content
+                ),
                 supporting_chunks=[
                     SourceChunkResponse(
                         id=chunk.id,
@@ -90,7 +126,7 @@ class ArticleResponse(BaseModel):
                     if (chunk := chunks_by_id.get(cid)) is not None
                 ],
             )
-            for s in article.sections
+            for i, s in enumerate(ordered_sections)
         ]
         latest_validation = (
             ValidationResultResponse.from_model(article.validation_results[-1])
@@ -102,7 +138,7 @@ class ArticleResponse(BaseModel):
             episode_id=article.episode_id,
             title=article.title,
             revision_count=article.revision_count,
-            episode_status=episode_status,
+            episode_status=episode.status,
             sections=sections,
             latest_validation=latest_validation,
             created_at=article.created_at,
@@ -192,6 +228,7 @@ class PublicArticleResponse(BaseModel):
         # gets its own fresh session/identity map) but not a guarantee
         # worth leaning on for a public response -- sort explicitly here.
         sections = sorted(article.sections, key=lambda s: s.sequence_number)
+        attribution = _podcast_attribution_sentence(episode)
         return cls(
             episode_id=article.episode_id,
             title=article.title,
@@ -204,7 +241,9 @@ class PublicArticleResponse(BaseModel):
                 PublicArticleSectionResponse(
                     sequence_number=s.sequence_number,
                     heading=s.heading,
-                    content=s.content,
+                    content=(
+                        f"{s.content}\n\n{attribution}" if i == len(sections) - 1 else s.content
+                    ),
                     supporting_sources=[
                         PublicSourceResponse(
                             start_ms=chunk.start_ms,
@@ -215,7 +254,7 @@ class PublicArticleResponse(BaseModel):
                         if (chunk := chunks_by_id.get(cid)) is not None
                     ],
                 )
-                for s in sections
+                for i, s in enumerate(sections)
             ],
         )
 

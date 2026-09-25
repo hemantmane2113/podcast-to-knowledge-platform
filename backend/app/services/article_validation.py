@@ -48,6 +48,52 @@ _MIN_SECTION_CONTENT_CHARS = 50
 _MIN_DUPLICATE_PARAGRAPH_CHARS = 40
 _MIN_ARTICLE_WORDS = 100
 
+# Generation-artifact detection: the model's structured-output response
+# occasionally leaks meta-commentary about its own generation/validation
+# process into what should be article prose -- e.g. "paragraphs
+# continuation error"/"paragraphs continuation invalid", observed in a
+# real generated article. Root cause: GeneratedSection's own Pydantic
+# validator (app/ai/schemas.py) previously only checked that paragraphs
+# were non-empty, never that they read as plausible prose -- a
+# syntactically valid response with garbage content sailed straight
+# through structured-output validation on the FIRST attempt, never
+# triggering ChatCompletionsProvider.generate_structured's existing
+# corrective-retry loop (app/providers/llm/_chat_completions.py) at all.
+# GeneratedSection's validator now imports generation_artifact_match from
+# here and rejects the same patterns immediately, at the point of
+# generation -- that DOES trigger the existing retry, so this is the
+# primary fix. This module's own use of the same patterns (via
+# is_section_content_valid/check_no_empty_sections below) is the final
+# deterministic safety net for anything that slips through anyway (a
+# pattern this list doesn't anticipate, or content persisted before this
+# fix existed) -- never the primary defense, per the explicit requirement
+# not to merely strip artifact text as a first resort.
+_GENERATION_ARTIFACT_PATTERNS = (
+    re.compile(r"\bparagraphs?\s+continuation\b", re.IGNORECASE),
+    re.compile(r"\bcontinuation\s+(?:error|invalid|failed)\b", re.IGNORECASE),
+    re.compile(r"\b(?:json|schema)\s+validation\s+(?:error|failed)\b", re.IGNORECASE),
+    re.compile(r"\bas an ai (?:language model|assistant)\b", re.IGNORECASE),
+    re.compile(r"\bi cannot (?:fulfill|comply with|generate|complete) (?:this|that|the)\b", re.IGNORECASE),
+    re.compile(r'"(?:heading|paragraphs)"\s*:', re.IGNORECASE),  # raw JSON leaking into prose
+    re.compile(r"```"),  # a markdown code fence should never appear in article prose
+)
+
+
+def generation_artifact_match(text: str) -> str | None:
+    """Returns the first matched artifact pattern's exact text, or None if
+    `text` reads as plausible article prose -- never a full "is this good
+    prose" judgment, just a narrow, conservative match against known
+    failure signatures, deliberately unlikely to ever match legitimate
+    editorial writing about a podcast. Shared by
+    app/ai/schemas.py::GeneratedSection (rejects at the structured-output
+    boundary, per paragraph) and is_section_content_valid below (the
+    final deterministic safety net, on the whole section's content)."""
+    for pattern in _GENERATION_ARTIFACT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0)
+    return None
+
 # Relative-shortness signal for check_no_empty_sections (requirement #5):
 # a section under both the ratio AND the absolute floor relative to the
 # article's own mean section length is "implausibly short" -- requiring
@@ -255,18 +301,38 @@ def is_section_content_valid(heading: str, content: str) -> bool:
     to decide whether an already-persisted ArticleSection represents
     genuinely completed work (safe to reuse on a resumed job) or must be
     regenerated -- the strongest existing deterministic signal, rather
-    than inventing a separate stage-completion marker."""
-    return bool(heading.strip()) and len(content.strip()) >= _MIN_SECTION_CONTENT_CHARS
+    than inventing a separate stage-completion marker. A section whose
+    content matches a known generation-artifact pattern (see
+    generation_artifact_match above) is never "genuinely completed work"
+    either, regardless of length -- resumability must regenerate it, not
+    silently reuse it (app/repositories/article_repository.py::upsert_section
+    then replaces it in place, the same as any other invalid-existing-row
+    case)."""
+    stripped_content = content.strip()
+    if not heading.strip() or len(stripped_content) < _MIN_SECTION_CONTENT_CHARS:
+        return False
+    return generation_artifact_match(stripped_content) is None
 
 
 def check_no_empty_sections(sections: list[ArticleSection]) -> CheckResult:
-    empty = [s.sequence_number for s in sections if not is_section_content_valid(s.heading, s.content)]
-    if empty:
+    empty: list[int] = []
+    reasons: dict[int, str] = {}
+    for s in sections:
+        if is_section_content_valid(s.heading, s.content):
+            continue
+        empty.append(s.sequence_number)
+        artifact = generation_artifact_match(s.content.strip())
         # "section N" phrasing per flagged section (not a bare list) so
         # app/ai/nodes/revision.py's regex-based targeting can regenerate
         # exactly the failing section(s) instead of falling back to
         # regenerating the whole article.
-        details = "; ".join(f"section {n} is empty or too short" for n in empty)
+        reasons[s.sequence_number] = (
+            f"section {s.sequence_number} contains a generation artifact ({artifact!r}), not real article prose"
+            if artifact is not None
+            else f"section {s.sequence_number} is empty or too short"
+        )
+    if empty:
+        details = "; ".join(reasons[n] for n in empty)
         return CheckResult("no_empty_sections", FAILURE, details, sections=tuple(empty))
 
     # Relative-shortness: a section far shorter than the article's own

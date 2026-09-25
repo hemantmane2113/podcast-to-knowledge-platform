@@ -71,7 +71,7 @@ async def get_article(
     """
     episode, article, chunks = await service.get_article_with_chunks(episode_id, is_draft=draft)
     chunks_by_id = {c.id: c for c in chunks}
-    return ArticleResponse.from_models(article, episode.status, chunks_by_id)
+    return ArticleResponse.from_models(article, episode, chunks_by_id)
 
 
 @router.post("/{episode_id}/publish", response_model=EpisodeResponse)
