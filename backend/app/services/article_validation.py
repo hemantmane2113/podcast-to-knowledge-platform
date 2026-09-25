@@ -80,6 +80,17 @@ _GENERATION_ARTIFACT_PATTERNS = (
     # anywhere) so it can never match unrelated prose that happens to use
     # that word (e.g. "the tradition continued for decades").
     re.compile(r"\bparagraphs?\s+continued\b", re.IGNORECASE),
+    # A third real generated article surfaced yet another word form of the
+    # same category: the model directly narrating a validation verdict
+    # about its own output ("paragraphs are invalid", "paragraph is not
+    # allowed") instead of writing prose. Requires "paragraph(s)" directly
+    # followed by "is"/"are" and then "invalid" or "not allowed" -- so it
+    # can never fire on legitimate prose that separately uses "paragraphs
+    # are ..." with an unrelated predicate ("are not always easy to
+    # follow", "are shorter than others") or "invalid"/"not allowed" about
+    # something else entirely ("paragraph is valid", "rules are not
+    # allowed to override the evidence").
+    re.compile(r"\bparagraphs?\s+(?:is|are)\s+(?:invalid|not\s+allowed)\b", re.IGNORECASE),
     re.compile(r"\bcontinuation\s+(?:error|invalid|failed)\b", re.IGNORECASE),
     re.compile(r"\b(?:json|schema)\s+validation\s+(?:error|failed)\b", re.IGNORECASE),
     re.compile(r"\bas an ai (?:language model|assistant)\b", re.IGNORECASE),

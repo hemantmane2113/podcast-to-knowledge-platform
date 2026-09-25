@@ -235,6 +235,41 @@ def test_generation_artifact_match_does_not_flag_continued_unrelated_to_paragrap
     assert generation_artifact_match("Training continued well into the evening, he said.") is None
 
 
+# A third real generated article (after both prior fixes) surfaced yet
+# another word form of the same failure mode: the model directly narrating
+# a validation verdict about its own output ("paragraphs are invalid",
+# "paragraph is not allowed") rather than writing article prose.
+
+
+def test_generation_artifact_match_detects_the_fourth_reported_artifact_paragraphs_are_invalid() -> None:
+    assert generation_artifact_match("paragraphs are invalid") is not None
+
+
+def test_generation_artifact_match_detects_the_fifth_reported_artifact_paragraphs_are_not_allowed() -> None:
+    assert generation_artifact_match("paragraphs are not allowed") is not None
+
+
+def test_generation_artifact_match_detects_the_singular_paragraph_is_invalid_variant() -> None:
+    assert generation_artifact_match("paragraph is invalid") is not None
+
+
+def test_generation_artifact_match_detects_the_singular_paragraph_is_not_allowed_variant() -> None:
+    assert generation_artifact_match("paragraph is not allowed") is not None
+
+
+def test_generation_artifact_match_does_not_flag_legitimate_prose_about_paragraph_validity() -> None:
+    # Every false-positive case the fix must survive: "paragraphs are ..."
+    # with an unrelated predicate, "paragraph is valid" (contains "valid"
+    # but never the substring "invalid"), an unrelated subject using
+    # "are not allowed", and the unrelated "continued" case from the prior
+    # fix -- none of these may ever be rejected.
+    assert generation_artifact_match("The paragraphs are not always easy to follow.") is None
+    assert generation_artifact_match("Some paragraphs are shorter than others.") is None
+    assert generation_artifact_match("The paragraph is valid but incomplete.") is None
+    assert generation_artifact_match("The rules are not allowed to override the evidence.") is None
+    assert generation_artifact_match("The tradition continued for decades.") is None
+
+
 def test_generation_artifact_match_returns_none_for_real_prose() -> None:
     real_prose = (
         "The conversation turns to how sleep affects memory consolidation, with concrete "
@@ -300,6 +335,86 @@ def test_generated_section_schema_rejects_the_paragraphs_continued_variant() -> 
 
     with pytest.raises(ValidationError, match="generation artifact"):
         GeneratedSection(heading="Section 5", paragraphs=["Some real content here.", "paragraphs continued?"])
+
+
+def test_generated_section_schema_rejects_the_exact_reported_paragraphs_are_invalid() -> None:
+    # Real reported string, section 2 of the third real generated article.
+    from pydantic import ValidationError
+
+    from app.ai.schemas import GeneratedSection
+
+    with pytest.raises(ValidationError, match="generation artifact"):
+        GeneratedSection(heading="Section 2", paragraphs=["Some real content here.", "paragraphs are invalid"])
+
+
+def test_generated_section_schema_rejects_the_exact_reported_paragraphs_are_not_allowed() -> None:
+    # Real reported string, section 4 of the third real generated article.
+    from pydantic import ValidationError
+
+    from app.ai.schemas import GeneratedSection
+
+    with pytest.raises(ValidationError, match="generation artifact"):
+        GeneratedSection(heading="Section 4", paragraphs=["Some real content here.", "paragraphs are not allowed"])
+
+
+def test_generated_section_schema_accepts_legitimate_prose_about_paragraph_validity() -> None:
+    from app.ai.schemas import GeneratedSection
+
+    section = GeneratedSection(
+        heading="Section 3",
+        paragraphs=["The paragraphs are not always easy to follow, but the underlying argument holds up."],
+    )
+    assert "not always easy to follow" in section.paragraphs[0]
+
+
+def test_check_no_empty_sections_fails_for_the_exact_reported_paragraphs_are_invalid() -> None:
+    # Real reported string, section 2 -- proves the deterministic safety
+    # net independently catches this artifact even if it somehow reached
+    # ArticleSection.content, not just the schema-level reject-and-retry.
+    result = check_no_empty_sections([_section(sequence_number=2, content="paragraphs are invalid")])
+    assert not result.passed
+    assert result.severity == FAILURE
+    assert result.sections == (2,)
+    assert "generation artifact" in result.details
+
+
+def test_check_no_empty_sections_fails_for_the_exact_reported_paragraphs_are_not_allowed() -> None:
+    # Real reported string, section 4.
+    result = check_no_empty_sections([_section(sequence_number=4, content="paragraphs are not allowed")])
+    assert not result.passed
+    assert result.severity == FAILURE
+    assert result.sections == (4,)
+    assert "generation artifact" in result.details
+
+
+def test_run_validation_fails_the_whole_report_for_the_exact_reported_paragraphs_are_invalid() -> None:
+    # End-to-end proof that run_validation().passed is False for a section
+    # containing this exact real artifact -- the specific defect reported:
+    # validation must never report passed=true when an artifact survives
+    # to ArticleSection.content.
+    normal = " ".join(["word"] * 900)
+    sections = [
+        _section(sequence_number=0, content=normal, supporting_chunk_ids=[]),
+        _section(sequence_number=1, content="paragraphs are invalid", supporting_chunk_ids=[]),
+        _section(sequence_number=2, content=normal, supporting_chunk_ids=[]),
+        _section(sequence_number=3, content="paragraphs are not allowed", supporting_chunk_ids=[]),
+        _section(sequence_number=4, content=normal, supporting_chunk_ids=[]),
+    ]
+    plan = _plan([{"sequence_number": n} for n in range(5)])
+    report = run_validation(
+        sections=sections,
+        plan=plan,
+        chunks=[],
+        topics=[],
+        transcript_word_count=10_000,
+        max_length_ratio=0.4,
+        min_sections=1,
+        max_sections=20,
+    )
+    assert report.passed is False
+    empty_check = next(c for c in report.checks if c.name == "no_empty_sections")
+    assert empty_check.severity == FAILURE
+    assert empty_check.sections == (1, 3)
 
 
 def test_generated_section_schema_accepts_legitimate_prose_about_paragraphs() -> None:
